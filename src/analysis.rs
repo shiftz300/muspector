@@ -1,6 +1,8 @@
+use crate::chain::{self, Chain, Fingerprint};
 use anyhow::{Context, Result, bail};
 use realfft::{RealFftPlanner, RealToComplex};
 use std::{
+    collections::VecDeque,
     fs::File,
     path::{Path, PathBuf},
     sync::Arc,
@@ -59,6 +61,7 @@ pub struct Report {
     pub clips: u64,
     pub spectrum: Vec<f64>,
     pub profile: Profile,
+    pub chain: Chain,
 }
 
 impl Report {
@@ -121,6 +124,7 @@ pub fn inspect(path: &Path) -> Result<Report> {
 
     let mut signal = Signal::new(rate);
     let mut timeline = Timeline::new(rate);
+    let mut space = Space::new(rate);
     let mut sample_buffer = None;
     let mut frames = 0_u64;
     let mut count = 0_u64;
@@ -165,6 +169,7 @@ pub fn inspect(path: &Path) -> Result<Report> {
                 mono += sample / channels as f32;
             }
             timeline.push(mono);
+            space.push(mono);
             signal.push(mono)?;
         }
     }
@@ -175,6 +180,15 @@ pub fn inspect(path: &Path) -> Result<Report> {
 
     let rms = (sum / count as f64).sqrt();
     let spectrum = signal.finish()?;
+    let profile = timeline.finish();
+    let space = space.finish();
+    let chain = chain::infer(fingerprint(
+        &profile,
+        db(peak),
+        db(peak) - db(rms),
+        &spectrum,
+        space,
+    ));
     Ok(Report {
         path: path.to_path_buf(),
         codec,
@@ -191,7 +205,8 @@ pub fn inspect(path: &Path) -> Result<Report> {
         high: spectrum.high,
         clips,
         spectrum: spectrum.curve,
-        profile: timeline.finish(),
+        profile,
+        chain,
     })
 }
 
@@ -255,6 +270,93 @@ struct Timeline {
     span: u64,
     meter: Meter,
     bins: Vec<Meter>,
+}
+
+#[derive(Clone, Copy)]
+struct Spaceprint {
+    echo: f64,
+    delay: f64,
+    tail: f64,
+}
+
+struct Space {
+    span: u64,
+    count: u64,
+    square: f64,
+    mean: f64,
+    ring: VecDeque<f64>,
+    corr: [f64; 51],
+    left: [f64; 51],
+    right: [f64; 51],
+}
+
+impl Space {
+    fn new(rate: u32) -> Self {
+        Self {
+            span: (rate as u64 / 50).max(1),
+            count: 0,
+            square: 0.0,
+            mean: 0.0,
+            ring: VecDeque::with_capacity(51),
+            corr: [0.0; 51],
+            left: [0.0; 51],
+            right: [0.0; 51],
+        }
+    }
+
+    fn push(&mut self, sample: f32) {
+        self.square += f64::from(sample) * f64::from(sample);
+        self.count += 1;
+        if self.count >= self.span {
+            self.flush();
+        }
+    }
+
+    fn flush(&mut self) {
+        if self.count == 0 {
+            return;
+        }
+        let envelope = (self.square / self.count as f64).sqrt();
+        self.mean = self.mean * 0.98 + envelope * 0.02;
+        let value = envelope - self.mean;
+        for lag in 3..=50 {
+            if self.ring.len() < lag {
+                continue;
+            }
+            let previous = self.ring[self.ring.len() - lag];
+            self.corr[lag] += value * previous;
+            self.left[lag] += value * value;
+            self.right[lag] += previous * previous;
+        }
+        self.ring.push_back(value);
+        if self.ring.len() > 50 {
+            self.ring.pop_front();
+        }
+        self.count = 0;
+        self.square = 0.0;
+    }
+
+    fn finish(mut self) -> Spaceprint {
+        self.flush();
+        let score = |lag: usize| {
+            let norm = (self.left[lag] * self.right[lag]).sqrt();
+            if norm <= FLOOR {
+                0.0
+            } else {
+                (self.corr[lag] / norm).max(0.0)
+            }
+        };
+        let (lag, echo) = (3..=50)
+            .map(|lag| (lag, score(lag)))
+            .max_by(|left, right| left.1.total_cmp(&right.1))
+            .unwrap_or((3, 0.0));
+        let tail = (3..=25).map(score).sum::<f64>() / 23.0;
+        Spaceprint {
+            echo,
+            delay: lag as f64 * 20.0,
+            tail,
+        }
+    }
 }
 
 impl Timeline {
@@ -381,6 +483,7 @@ impl Signal {
 struct Spectrum {
     centroid: f64,
     rolloff: f64,
+    flatness: f64,
     low: f64,
     mid: f64,
     high: f64,
@@ -395,6 +498,7 @@ impl Spectrum {
             return Ok(Self {
                 centroid: 0.0,
                 rolloff: 0.0,
+                flatness: 0.0,
                 low: -120.0,
                 mid: -120.0,
                 high: -120.0,
@@ -432,15 +536,88 @@ impl Spectrum {
             10.0 * (power / total).max(FLOOR).log10()
         };
 
+        let audible: Vec<_> = bins
+            .iter()
+            .enumerate()
+            .skip(1)
+            .take_while(|(index, _)| *index as f64 * bin_hz <= 20_000.0)
+            .map(|(_, power)| *power)
+            .collect();
+        let arithmetic = audible.iter().sum::<f64>() / audible.len().max(1) as f64;
+        let geometric = (audible
+            .iter()
+            .map(|power| power.max(FLOOR).ln())
+            .sum::<f64>()
+            / audible.len().max(1) as f64)
+            .exp();
+        let flatness = if arithmetic <= FLOOR {
+            0.0
+        } else {
+            (geometric / arithmetic).clamp(0.0, 1.0)
+        };
+
         Ok(Self {
             centroid,
             rolloff,
+            flatness,
             low: band(20.0, 250.0),
             mid: band(250.0, 4_000.0),
             high: band(4_000.0, 20_000.0),
             curve: chart(bins, rate),
         })
     }
+}
+
+fn fingerprint(
+    profile: &Profile,
+    peak: f64,
+    crest: f64,
+    spectrum: &Spectrum,
+    space: Spaceprint,
+) -> Fingerprint {
+    let mut levels: Vec<_> = profile.points.iter().map(|point| point.level).collect();
+    levels.sort_by(f64::total_cmp);
+    let floor = quantile(&levels, 0.1);
+    let range = quantile(&levels, 0.9) - floor;
+    let silence = if levels.is_empty() {
+        0.0
+    } else {
+        levels.iter().filter(|level| **level <= -48.0).count() as f64 / levels.len() as f64
+    };
+    let transient = if profile.points.len() < 2 {
+        0.0
+    } else {
+        let change = profile
+            .points
+            .windows(2)
+            .map(|pair| (pair[1].level - pair[0].level).abs())
+            .sum::<f64>()
+            / (profile.points.len() - 1) as f64;
+        (change / 8.0).clamp(0.0, 1.0)
+    };
+    Fingerprint {
+        peak,
+        crest,
+        range,
+        floor,
+        silence,
+        transient,
+        flatness: spectrum.flatness,
+        low: spectrum.low,
+        mid: spectrum.mid,
+        high: spectrum.high,
+        echo: space.echo,
+        echo_ms: space.delay,
+        tail: space.tail,
+    }
+}
+
+fn quantile(values: &[f64], amount: f64) -> f64 {
+    if values.is_empty() {
+        return -72.0;
+    }
+    let index = (amount.clamp(0.0, 1.0) * values.len().saturating_sub(1) as f64).round() as usize;
+    values[index]
 }
 
 fn chart(bins: &[f64], rate: u32) -> Vec<f64> {

@@ -1,6 +1,7 @@
 mod analysis;
 mod app;
 mod assets;
+mod chain;
 mod theme;
 
 use app::Muspector;
@@ -13,6 +14,7 @@ fn main() {
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
+                window_min_size: Some(size(px(580.0), px(640.0))),
                 ..Default::default()
             },
             |_window, cx| cx.new(Muspector::new),
