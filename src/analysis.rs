@@ -26,6 +26,20 @@ const FFT: usize = 4096;
 const HOP: usize = 2048;
 const FLOOR: f64 = 1.0e-12;
 const CHART: usize = 64;
+const LIMIT: usize = 4096;
+const POINTS: usize = 192;
+
+#[derive(Clone, Debug)]
+pub struct Point {
+    pub min: f32,
+    pub max: f32,
+    pub level: f64,
+}
+
+#[derive(Clone, Debug)]
+pub struct Profile {
+    pub points: Vec<Point>,
+}
 
 #[derive(Clone, Debug)]
 pub struct Report {
@@ -44,6 +58,7 @@ pub struct Report {
     pub high: f64,
     pub clips: u64,
     pub spectrum: Vec<f64>,
+    pub profile: Profile,
 }
 
 impl Report {
@@ -105,6 +120,7 @@ pub fn inspect(path: &Path) -> Result<Report> {
         .context("没有适合这个音轨的解码器")?;
 
     let mut signal = Signal::new(rate);
+    let mut timeline = Timeline::new(rate);
     let mut sample_buffer = None;
     let mut frames = 0_u64;
     let mut count = 0_u64;
@@ -148,6 +164,7 @@ pub fn inspect(path: &Path) -> Result<Report> {
                 clips += u64::from(absolute >= 0.999_9);
                 mono += sample / channels as f32;
             }
+            timeline.push(mono);
             signal.push(mono)?;
         }
     }
@@ -174,7 +191,127 @@ pub fn inspect(path: &Path) -> Result<Report> {
         high: spectrum.high,
         clips,
         spectrum: spectrum.curve,
+        profile: timeline.finish(),
     })
+}
+
+#[derive(Clone, Copy)]
+struct Meter {
+    min: f32,
+    max: f32,
+    square: f64,
+    count: u64,
+}
+
+impl Meter {
+    fn empty() -> Self {
+        Self {
+            min: 1.0,
+            max: -1.0,
+            square: 0.0,
+            count: 0,
+        }
+    }
+
+    fn push(&mut self, sample: f32) {
+        self.min = self.min.min(sample);
+        self.max = self.max.max(sample);
+        self.square += f64::from(sample) * f64::from(sample);
+        self.count += 1;
+    }
+
+    fn merge(&mut self, other: Self) {
+        if other.count == 0 {
+            return;
+        }
+        if self.count == 0 {
+            *self = other;
+            return;
+        }
+        self.min = self.min.min(other.min);
+        self.max = self.max.max(other.max);
+        self.square += other.square;
+        self.count += other.count;
+    }
+
+    fn point(self) -> Point {
+        if self.count == 0 {
+            return Point {
+                min: 0.0,
+                max: 0.0,
+                level: -72.0,
+            };
+        }
+        let rms = (self.square / self.count as f64).sqrt();
+        Point {
+            min: self.min,
+            max: self.max,
+            level: db(rms).clamp(-72.0, 0.0),
+        }
+    }
+}
+
+struct Timeline {
+    span: u64,
+    meter: Meter,
+    bins: Vec<Meter>,
+}
+
+impl Timeline {
+    fn new(rate: u32) -> Self {
+        Self {
+            span: (rate as u64 / 40).max(1),
+            meter: Meter::empty(),
+            bins: Vec::with_capacity(LIMIT),
+        }
+    }
+
+    fn push(&mut self, sample: f32) {
+        self.meter.push(sample);
+        if self.meter.count >= self.span {
+            self.bins.push(self.meter);
+            self.meter = Meter::empty();
+            if self.bins.len() >= LIMIT {
+                self.shrink();
+            }
+        }
+    }
+
+    fn shrink(&mut self) {
+        let mut bins = Vec::with_capacity(self.bins.len().div_ceil(2));
+        for pair in self.bins.chunks(2) {
+            let mut meter = Meter::empty();
+            for item in pair {
+                meter.merge(*item);
+            }
+            bins.push(meter);
+        }
+        self.bins = bins;
+        self.span = self.span.saturating_mul(2);
+    }
+
+    fn finish(mut self) -> Profile {
+        if self.meter.count > 0 {
+            self.bins.push(self.meter);
+        }
+        if self.bins.is_empty() {
+            return Profile { points: Vec::new() };
+        }
+
+        let size = self.bins.len().div_ceil(POINTS).max(1);
+        let points = self
+            .bins
+            .chunks(size)
+            .map(|chunk| {
+                let mut meter = Meter::empty();
+                for item in chunk {
+                    meter.merge(*item);
+                }
+                meter.point()
+            })
+            .collect();
+        Profile { points }
+    }
 }
 
 struct Signal {
@@ -393,6 +530,19 @@ mod tests {
     }
 
     #[test]
+    fn profile_is_bounded() {
+        let mut timeline = Timeline::new(48_000);
+        for index in 0..(48_000 * 240) {
+            let phase = std::f32::consts::TAU * 220.0 * index as f32 / 48_000.0;
+            timeline.push(phase.sin() * 0.5);
+        }
+        let profile = timeline.finish();
+        assert!(!profile.points.is_empty());
+        assert!(profile.points.len() <= POINTS);
+        assert!(profile.points.iter().all(|point| point.level.is_finite()));
+    }
+
+    #[test]
     fn inspects_pcm_wav() {
         let path = std::env::temp_dir().join(format!("muspector-{}.wav", std::process::id()));
         let rate = 48_000_u32;
@@ -427,5 +577,7 @@ mod tests {
         assert!((report.centroid - 440.0).abs() < 30.0);
         assert_eq!(report.spectrum.len(), CHART);
         assert!(report.spectrum.iter().all(|value| value.is_finite()));
+        assert!(!report.profile.points.is_empty());
+        assert!(report.profile.points.len() <= POINTS);
     }
 }

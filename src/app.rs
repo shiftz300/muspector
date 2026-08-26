@@ -3,11 +3,13 @@ use crate::{
     theme,
 };
 use gpui::{
-    Animation, AnimationExt, AnyElement, AppContext, ClickEvent, Context, Div, ExternalPaths,
-    IntoElement, PathBuilder, PathPromptOptions, Render, Styled, Timer, Window, canvas, div,
-    ease_in_out, point, prelude::*, px, svg,
+    Animation, AnimationExt, AnyElement, AppContext, Bounds, ClickEvent, Context, Div,
+    ExternalPaths, IntoElement, MouseMoveEvent, PathBuilder, PathPromptOptions, Pixels, Render,
+    Styled, Timer, Window, canvas, div, ease_in_out, point, prelude::*, px, size, svg,
 };
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::time::Duration;
 
 const FADE_OUT: Duration = Duration::from_millis(90);
@@ -67,11 +69,13 @@ pub struct Muspector {
     glows: [usize; 3],
     alert: Option<Alert>,
     notice: usize,
+    cursor: Option<f32>,
+    fit: bool,
 }
 
 impl Muspector {
-    pub fn new(_cx: &mut Context<Self>) -> Self {
-        Self {
+    pub fn new(cx: &mut Context<Self>) -> Self {
+        let mut this = Self {
             tab: Tab::Inspect,
             state: State::Empty,
             job: 0,
@@ -81,7 +85,13 @@ impl Muspector {
             glows: [0; 3],
             alert: None,
             notice: 0,
+            cursor: None,
+            fit: false,
+        };
+        if let Some(path) = std::env::args_os().nth(1) {
+            this.start(PathBuf::from(path), cx);
         }
+        this
     }
 
     fn warn(&mut self, text: String, cx: &mut Context<Self>) {
@@ -201,6 +211,8 @@ impl Muspector {
             self.notice = self.notice.wrapping_add(1);
         }
         self.job = self.job.wrapping_add(1);
+        self.cursor = None;
+        self.fit = false;
         let job = self.job;
         self.state = State::Loading(path.clone());
         cx.notify();
@@ -235,6 +247,7 @@ impl Muspector {
         self.cycle = self.cycle.wrapping_add(1);
         let cycle = self.cycle;
         self.fade = Fade::Out;
+        self.cursor = None;
         cx.notify();
 
         cx.spawn(async move |view, cx| {
@@ -535,10 +548,13 @@ impl Muspector {
 
     fn report(&self, report: &Report, cx: &mut Context<Self>) -> AnyElement {
         div()
+            .id("report")
             .flex_1()
+            .min_h_0()
             .w_full()
             .flex()
             .flex_col()
+            .overflow_y_scroll()
             .gap_3()
             .child(
                 div()
@@ -607,6 +623,7 @@ impl Muspector {
                     .child(metric("RMS", format!("{:.1} dB", report.rms)))
                     .child(metric("Crest", format!("{:.1} dB", report.crest))),
             )
+            .child(self.profile(report, cx))
             .child(spectrum(report))
             .child(
                 div()
@@ -655,6 +672,205 @@ impl Muspector {
             .into_any_element()
     }
 
+    fn profile(&self, report: &Report, cx: &mut Context<Self>) -> AnyElement {
+        let points = report.profile.points.clone();
+        let duration = report.duration;
+        let cursor = self.cursor;
+        let bounds: Rc<RefCell<Option<Bounds<Pixels>>>> = Rc::new(RefCell::new(None));
+        let capture = bounds.clone();
+        let locate = bounds.clone();
+
+        let detail = cursor
+            .and_then(|position| {
+                let index = (position * points.len().saturating_sub(1) as f32).round() as usize;
+                points.get(index).map(|point| {
+                    let peak = f64::from(point.min.abs().max(point.max.abs()));
+                    format!(
+                        "{}  ·  Peak {:.1} dB  ·  RMS {:.1} dB",
+                        stamp(duration * f64::from(position)),
+                        level(peak),
+                        point.level
+                    )
+                })
+            })
+            .unwrap_or_else(|| "Hover to inspect".to_owned());
+
+        let chart = div()
+            .id("profile")
+            .h(px(136.0))
+            .w_full()
+            .relative()
+            .rounded(theme::RADIUS)
+            .overflow_hidden()
+            .bg(theme::TRACK)
+            .cursor_crosshair()
+            .child(
+                canvas(
+                    move |area, _, _| {
+                        *capture.borrow_mut() = Some(area);
+                    },
+                    move |area, _, window, _| {
+                        let left = area.origin.x + px(10.0);
+                        let right = area.origin.x + area.size.width - px(10.0);
+                        let top = area.origin.y + px(10.0);
+                        let bottom = area.origin.y + area.size.height - px(20.0);
+                        let width = right - left;
+                        let wave_bottom = top + (bottom - top) * 0.62;
+                        let middle = top + (wave_bottom - top) * 0.5;
+                        let amplitude = (wave_bottom - top) * 0.45;
+                        let level_top = wave_bottom + px(12.0);
+
+                        let mut grid = theme::LINE;
+                        grid.a = 0.55;
+                        for y in [middle, wave_bottom, level_top] {
+                            let mut path = PathBuilder::stroke(px(1.0));
+                            path.move_to(point(left, y));
+                            path.line_to(point(right, y));
+                            if let Ok(path) = path.build() {
+                                window.paint_path(path, grid);
+                            }
+                        }
+
+                        if points.len() > 1 {
+                            let x = |index: usize| {
+                                left + width * (index as f32 / (points.len() - 1) as f32)
+                            };
+                            let mut wave = PathBuilder::fill();
+                            for (index, item) in points.iter().enumerate() {
+                                let point = point(x(index), middle - amplitude * item.max);
+                                if index == 0 {
+                                    wave.move_to(point);
+                                } else {
+                                    wave.line_to(point);
+                                }
+                            }
+                            for (index, item) in points.iter().enumerate().rev() {
+                                wave.line_to(point(x(index), middle - amplitude * item.min));
+                            }
+                            wave.close();
+                            if let Ok(path) = wave.build() {
+                                window.paint_path(path, theme::ACCENT_SOFT);
+                            }
+
+                            let mut peak = PathBuilder::stroke(px(1.0));
+                            for (index, item) in points.iter().enumerate() {
+                                let sample = item.min.abs().max(item.max.abs());
+                                let point = point(x(index), middle - amplitude * sample);
+                                if index == 0 {
+                                    peak.move_to(point);
+                                } else {
+                                    peak.line_to(point);
+                                }
+                            }
+                            if let Ok(path) = peak.build() {
+                                window.paint_path(path, theme::ACCENT);
+                            }
+
+                            let mut rms = PathBuilder::stroke(px(1.5));
+                            for (index, item) in points.iter().enumerate() {
+                                let value = ((item.level + 72.0) / 72.0).clamp(0.0, 1.0) as f32;
+                                let point = point(x(index), bottom - (bottom - level_top) * value);
+                                if index == 0 {
+                                    rms.move_to(point);
+                                } else {
+                                    rms.line_to(point);
+                                }
+                            }
+                            if let Ok(path) = rms.build() {
+                                window.paint_path(path, theme::ACCENT_HOVER);
+                            }
+                        }
+
+                        if let Some(position) = cursor {
+                            let x = left + width * position;
+                            let mut marker = PathBuilder::stroke(px(1.0));
+                            marker.move_to(point(x, top));
+                            marker.line_to(point(x, bottom));
+                            if let Ok(path) = marker.build() {
+                                window.paint_path(path, theme::INK);
+                            }
+                        }
+                    },
+                )
+                .size_full(),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .left_3()
+                    .top_1()
+                    .text_xs()
+                    .text_color(theme::FAINT)
+                    .child("Wave"),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .left_3()
+                    .top(px(78.0))
+                    .text_xs()
+                    .text_color(theme::FAINT)
+                    .child("RMS"),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .left_3()
+                    .right_3()
+                    .bottom_1()
+                    .flex()
+                    .justify_between()
+                    .text_xs()
+                    .text_color(theme::FAINT)
+                    .child("0:00")
+                    .child(stamp(duration)),
+            )
+            .on_mouse_move(cx.listener(move |this, event: &MouseMoveEvent, _, cx| {
+                let Some(area) = *locate.borrow() else {
+                    return;
+                };
+                let width = f32::from(area.size.width);
+                if width <= 0.0 {
+                    return;
+                }
+                let position =
+                    (f32::from(event.position.x - area.origin.x) / width).clamp(0.0, 1.0);
+                if this
+                    .cursor
+                    .is_none_or(|current| (current - position).abs() > 0.002)
+                {
+                    this.cursor = Some(position);
+                    cx.notify();
+                }
+            }))
+            .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                if !hovered && this.cursor.take().is_some() {
+                    cx.notify();
+                }
+            }));
+
+        div()
+            .w_full()
+            .p_3()
+            .rounded(theme::RADIUS)
+            .border_1()
+            .border_color(theme::LINE)
+            .bg(theme::SURFACE)
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                div()
+                    .flex()
+                    .items_start()
+                    .justify_between()
+                    .child(section("Profile", "Waveform · short-term RMS"))
+                    .child(div().text_xs().text_color(theme::MUTED).child(detail)),
+            )
+            .child(chart)
+            .into_any_element()
+    }
+
     fn remix(&self) -> AnyElement {
         div()
             .flex_1()
@@ -697,7 +913,28 @@ impl Muspector {
 }
 
 impl Render for Muspector {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if matches!(self.state, State::Ready(_)) && !self.fit {
+            self.fit = true;
+            let current = window.viewport_size();
+            let available = window
+                .display(cx)
+                .map(|display| display.bounds().size)
+                .unwrap_or(size(px(620.0), px(920.0)));
+            let width = current
+                .width
+                .max(px(620.0))
+                .min((available.width - px(40.0)).max(px(480.0)));
+            let height = current
+                .height
+                .max(px(920.0))
+                .min((available.height - px(80.0)).max(px(640.0)));
+            let fitted = size(width, height);
+            if fitted != current {
+                window.resize(fitted);
+            }
+        }
+
         let content = match self.tab {
             Tab::Inspect => self.inspect(cx),
             Tab::Remix => self.remix(),
@@ -969,6 +1206,22 @@ fn position(frequency: f64, high: f64) -> f32 {
         return 0.0;
     }
     ((frequency / 20.0).ln() / (high / 20.0).ln()).clamp(0.0, 1.0) as f32
+}
+
+fn level(value: f64) -> f64 {
+    20.0 * value.max(1.0e-12).log10()
+}
+
+fn stamp(seconds: f64) -> String {
+    let total = seconds.max(0.0).round() as u64;
+    let hours = total / 3_600;
+    let minutes = (total % 3_600) / 60;
+    let seconds = total % 60;
+    if hours > 0 {
+        format!("{hours}:{minutes:02}:{seconds:02}")
+    } else {
+        format!("{minutes}:{seconds:02}")
+    }
 }
 
 fn supported(path: &std::path::Path) -> bool {

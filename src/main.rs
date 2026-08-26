@@ -9,7 +9,7 @@ use gpui::{AppContext, Application, Bounds, WindowBounds, WindowOptions, px, siz
 
 fn main() {
     Application::new().with_assets(Assets).run(|cx| {
-        let bounds = Bounds::centered(None, size(px(520.0), px(680.0)), cx);
+        let bounds = Bounds::centered(None, size(px(580.0), px(760.0)), cx);
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
