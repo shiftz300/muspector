@@ -1,0 +1,39 @@
+[package]
+name = "muspector"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+license = "Apache-2.0"
+description = "A compact audio inspector built with GPUI"
+
+[dependencies]
+anyhow = "1.0"
+gpui = { version = "0.2.2", default-features = false, features = ["font-kit", "macos-blade"] }
+realfft = "3.5"
+symphonia = { version = "0.5.5", default-features = false, features = [
+    "aac",
+    "alac",
+    "flac",
+    "isomp4",
+    "mp3",
+    "ogg",
+    "pcm",
+    "vorbis",
+    "wav",
+] }
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+lto = "thin"
+strip = true
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "warn"
