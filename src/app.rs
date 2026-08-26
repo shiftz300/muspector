@@ -17,6 +17,7 @@ use std::time::Duration;
 const FADE_OUT: Duration = Duration::from_millis(90);
 const FADE_IN: Duration = Duration::from_millis(130);
 const TINT: Duration = Duration::from_millis(140);
+const CARD: Duration = Duration::from_millis(180);
 const HOLD: Duration = Duration::from_millis(2800);
 const OPEN: usize = 0;
 
@@ -302,13 +303,31 @@ impl Muspector {
     }
 
     fn toggle(&mut self, effect: usize, cx: &mut Context<Self>) {
-        if let State::Ready(report) = &mut self.state
-            && let Some(item) = report.chain.effects.get_mut(effect)
         {
+            let State::Ready(report) = &mut self.state else {
+                return;
+            };
+            let Some(item) = report.chain.effects.get_mut(effect) else {
+                return;
+            };
             item.active = !item.active;
-            self.cards[effect] = self.cards[effect].wrapping_add(1);
-            cx.notify();
         }
+
+        let slot: usize = effect;
+        self.cards[slot] = self.cards[slot].wrapping_add(1);
+        let card: usize = self.cards[slot];
+        cx.notify();
+
+        cx.spawn(async move |view, cx| {
+            Timer::after(CARD).await;
+            let _ = view.update(cx, move |this, cx| {
+                if this.cards[slot] == card {
+                    this.cards[slot] = 0;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
 
     fn adjust(&mut self, effect: usize, param: usize, direction: f64, cx: &mut Context<Self>) {
@@ -329,9 +348,7 @@ impl Muspector {
         if let (State::Ready(report), Some(baseline)) = (&mut self.state, &self.baseline) {
             report.chain = baseline.clone();
             self.edit = None;
-            for card in &mut self.cards {
-                *card = card.wrapping_add(1);
-            }
+            self.cards = [0; 6];
             cx.notify();
         }
     }
@@ -852,12 +869,7 @@ impl Muspector {
                             .child(names.join("  →  ")),
                     ),
             );
-        card.with_animation(
-            ("chain-in", self.job),
-            Animation::new(Duration::from_millis(180)).with_easing(ease_in_out),
-            |card, delta| card.opacity(delta),
-        )
-        .into_any_element()
+        card.into_any_element()
     }
 
     fn profile(&self, report: &Report, cx: &mut Context<Self>) -> AnyElement {
@@ -1244,17 +1256,15 @@ impl Muspector {
                 }),
             ));
         let end = if active { 1.0 } else { 0.58 };
-        let start = if self.cards[index] == 0 {
-            0.0
-        } else if active {
-            0.58
-        } else {
-            1.0
-        };
+        if self.cards[index] == 0 {
+            return card.opacity(end).into_any_element();
+        }
+
+        let start = if active { 0.58 } else { 1.0 };
         let token = self.job.wrapping_mul(10_000) + index as u64 * 100 + self.cards[index] as u64;
         card.with_animation(
             ("effect", token),
-            Animation::new(Duration::from_millis(180)).with_easing(ease_in_out),
+            Animation::new(CARD).with_easing(ease_in_out),
             move |card, delta| card.opacity(start + (end - start) * delta),
         )
         .into_any_element()
