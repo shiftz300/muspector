@@ -54,7 +54,7 @@ enum Hover {
 enum State {
     Empty,
     Loading(PathBuf),
-    Ready(Report),
+    Ready(Box<Report>),
 }
 
 struct Alert {
@@ -249,7 +249,7 @@ impl Muspector {
                 match result {
                     Ok(report) => {
                         this.baseline = Some(report.chain.clone());
-                        this.state = State::Ready(report);
+                        this.state = State::Ready(Box::new(report));
                         cx.notify();
                     }
                     Err(error) => {
@@ -354,13 +354,13 @@ impl Muspector {
     }
 
     fn begin(&mut self, effect: usize, param: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(value) = (match &self.state {
+        let Some(text) = (match &self.state {
             State::Ready(report) => report
                 .chain
                 .effects
                 .get(effect)
                 .and_then(|effect| effect.params.get(param))
-                .map(|param| param.value),
+                .map(Param::input),
             State::Empty | State::Loading(_) => None,
         }) else {
             return;
@@ -368,7 +368,7 @@ impl Muspector {
         self.edit = Some(Edit {
             effect,
             param,
-            text: value.to_string(),
+            text,
             fresh: true,
         });
         window.focus(&self.focus);
@@ -830,7 +830,7 @@ impl Muspector {
     }
 
     fn summary(&self, chain: &Chain, cx: &mut Context<Self>) -> AnyElement {
-        let names: Vec<_> = chain.active().map(|effect| effect.kind.name()).collect();
+        let names: Vec<_> = chain.active().map(Effect::name).collect();
         let card = div()
             .id("chain")
             .w_full()
@@ -846,7 +846,14 @@ impl Muspector {
             .cursor_pointer()
             .hover(|node| node.bg(theme::HOVER))
             .on_click(cx.listener(|this, _event, _window, cx| this.switch(Tab::Remix, cx)))
-            .child(section("Chain", "Heuristic candidate · open to tune"))
+            .child(section(
+                "Chain",
+                if chain.blind {
+                    "GFX blind + heuristic · open to tune"
+                } else {
+                    "Heuristic candidate · open to tune"
+                },
+            ))
             .child(
                 div()
                     .min_w_0()
@@ -1135,9 +1142,14 @@ impl Muspector {
                                     .child("Candidate"),
                             )
                             .child(div().text_xs().text_color(theme::MUTED).child(format!(
-                                "{} · {:.0}% heuristic confidence",
+                                "{} · {:.0}% {} confidence",
                                 report.name(),
-                                report.chain.score * 100.0
+                                report.chain.score * 100.0,
+                                if report.chain.blind {
+                                    "hybrid"
+                                } else {
+                                    "heuristic"
+                                }
                             ))),
                     )
                     .child(
@@ -1206,7 +1218,7 @@ impl Muspector {
                                             .text_sm()
                                             .font_weight(gpui::FontWeight::SEMIBOLD)
                                             .text_color(theme::INK)
-                                            .child(effect.kind.name()),
+                                            .child(effect.name().to_owned()),
                                     )
                                     .child(
                                         div()

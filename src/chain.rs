@@ -32,7 +32,7 @@ pub struct Param {
 }
 
 impl Param {
-    fn new(
+    pub(crate) fn new(
         name: &'static str,
         value: f64,
         min: f64,
@@ -63,6 +63,16 @@ impl Param {
         }
     }
 
+    pub fn input(&self) -> String {
+        if self.step >= 1.0 {
+            format!("{:.0}", self.value)
+        } else if self.step >= 0.1 {
+            format!("{:.1}", self.value)
+        } else {
+            format!("{:.2}", self.value)
+        }
+    }
+
     pub fn shift(&mut self, direction: f64) {
         self.set(self.value + self.step * direction);
     }
@@ -75,21 +85,46 @@ impl Param {
 #[derive(Clone, Debug)]
 pub struct Effect {
     pub kind: Kind,
+    pub model: Option<String>,
     pub active: bool,
     pub score: f64,
     pub evidence: String,
     pub params: Vec<Param>,
 }
 
+impl Effect {
+    pub fn name(&self) -> &str {
+        self.model.as_deref().unwrap_or_else(|| self.kind.name())
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Chain {
     pub effects: Vec<Effect>,
     pub score: f64,
+    pub blind: bool,
 }
 
 impl Chain {
     pub fn active(&self) -> impl Iterator<Item = &Effect> {
         self.effects.iter().filter(|effect| effect.active)
+    }
+
+    pub fn drive(&mut self, effect: Effect) {
+        if let Some(slot) = self
+            .effects
+            .iter_mut()
+            .find(|candidate| candidate.kind == Kind::Drive)
+        {
+            *slot = effect;
+            self.blind = true;
+            let active: Vec<_> = self.active().collect();
+            self.score = if active.is_empty() {
+                0.0
+            } else {
+                active.iter().map(|effect| effect.score).sum::<f64>() / active.len() as f64
+            };
+        }
     }
 }
 
@@ -122,6 +157,7 @@ pub fn infer(f: Fingerprint) -> Chain {
     let effects = vec![
         Effect {
             kind: Kind::Gate,
+            model: None,
             active: gate >= 0.55,
             score: gate,
             evidence: format!(
@@ -140,6 +176,7 @@ pub fn infer(f: Fingerprint) -> Chain {
         },
         Effect {
             kind: Kind::Comp,
+            model: None,
             active: comp >= 0.48,
             score: comp,
             evidence: format!("Crest {:.1} dB · range {:.1} dB", f.crest, f.range),
@@ -158,6 +195,7 @@ pub fn infer(f: Fingerprint) -> Chain {
         },
         Effect {
             kind: Kind::Drive,
+            model: None,
             active: drive >= 0.55,
             score: drive,
             evidence: format!(
@@ -179,6 +217,7 @@ pub fn infer(f: Fingerprint) -> Chain {
         },
         Effect {
             kind: Kind::Eq,
+            model: None,
             active: true,
             score: 0.58,
             evidence: format!(
@@ -193,6 +232,7 @@ pub fn infer(f: Fingerprint) -> Chain {
         },
         Effect {
             kind: Kind::Delay,
+            model: None,
             active: delay >= 0.52,
             score: delay,
             evidence: format!("Envelope echo {:.2} near {:.0} ms", f.echo, f.echo_ms),
@@ -204,6 +244,7 @@ pub fn infer(f: Fingerprint) -> Chain {
         },
         Effect {
             kind: Kind::Reverb,
+            model: None,
             active: reverb >= 0.45,
             score: reverb,
             evidence: format!("Diffuse envelope persistence {:.2}", f.tail),
@@ -228,7 +269,11 @@ pub fn infer(f: Fingerprint) -> Chain {
     } else {
         (active.iter().map(|effect| effect.score).sum::<f64>() / active.len() as f64).min(0.78)
     };
-    Chain { effects, score }
+    Chain {
+        effects,
+        score,
+        blind: false,
+    }
 }
 
 fn scale(value: f64, low: f64, high: f64) -> f64 {

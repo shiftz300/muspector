@@ -1,6 +1,7 @@
 mod analysis;
 mod app;
 mod assets;
+mod blind;
 mod chain;
 mod theme;
 

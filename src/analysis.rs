@@ -1,4 +1,7 @@
-use crate::chain::{self, Chain, Fingerprint};
+use crate::{
+    blind,
+    chain::{self, Chain, Fingerprint},
+};
 use anyhow::{Context, Result, bail};
 use realfft::{RealFftPlanner, RealToComplex};
 use std::{
@@ -131,6 +134,7 @@ pub fn inspect(path: &Path) -> Result<Report> {
     let mut sum = 0.0_f64;
     let mut peak = 0.0_f64;
     let mut clips = 0_u64;
+    let mut scan = blind::Scan::new(rate);
 
     loop {
         let packet = match format.next_packet() {
@@ -171,6 +175,7 @@ pub fn inspect(path: &Path) -> Result<Report> {
             timeline.push(mono);
             space.push(mono);
             signal.push(mono)?;
+            scan.push(mono);
         }
     }
 
@@ -182,13 +187,15 @@ pub fn inspect(path: &Path) -> Result<Report> {
     let spectrum = signal.finish()?;
     let profile = timeline.finish();
     let space = space.finish();
-    let chain = chain::infer(fingerprint(
+    let mut chain = chain::infer(fingerprint(
         &profile,
         db(peak),
         db(peak) - db(rms),
         &spectrum,
         space,
     ));
+    let model = scan.finish().context("GFX blind analysis failed")?;
+    chain.drive(model.effect());
     Ok(Report {
         path: path.to_path_buf(),
         codec,

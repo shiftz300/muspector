@@ -1,9 +1,9 @@
 # Muspector
 
 Muspector is a compact GPUI audio inspector for studying guitar tones. The
-current MVP performs fast local analysis, proposes an editable effect chain,
-and estimates useful starting parameters. Audio playback is intentionally
-deferred.
+current MVP performs local analysis, uses GFX Classifier to identify a likely
+drive/fuzz unit and its controls, and proposes an editable hybrid effect chain.
+Audio playback is intentionally deferred.
 
 ## Requirements
 
@@ -69,20 +69,39 @@ For a manual UI check, run `cargo dev` and verify that:
 - a 64-band logarithmic spectrum with low/mid/high energy, spectral centroid,
   and 85% rolloff markers
 - bounded envelope correlation for delay and diffuse-tail evidence
-- Gate, Comp, Drive, EQ, Delay, and Reverb candidates with confidence,
-  evidence, and editable parameters
+- GFX blind classification for 13 drive/fuzz units and model-estimated Level,
+  Gain/Drive/Distortion, and Tone/Filter controls
+- heuristic Gate, Comp, EQ, Delay, and Reverb candidates with editable controls
 
 Decoding runs on GPUI's background executor. Spectral analysis is streaming and
 keeps only a 4096-sample FFT window plus accumulated bins in memory. Profile
 analysis uses bounded streaming buckets and retains at most 192 display points.
-Effect inference is heuristic: wet audio alone does not uniquely identify a
-pedal model, order, or knob settings. Isolated guitar produces more meaningful
-results than a full mix; render-and-compare fitting is planned with playback.
+The blind pass selects up to five high-energy two-second windows, converts them
+to the model's original 22.05 kHz / 128-band power-Mel input, and averages their
+predictions. Python is not required at runtime.
+
+GFX was trained on isolated wet guitar and only covers overdrive, distortion,
+and fuzz. A result from a full mix or a different effect family is out of
+distribution. It does not recover a complete chain or its order, so the UI
+labels the current result as GFX blind plus heuristic analysis. Paired
+render-and-compare analysis is planned around StemFX after the blind workflow.
+
+## Models and licenses
+
+- GFX Classifier code and model weights: BSD-3-Clause. The converted weights,
+  attribution, and upstream links are in `models/gfx`.
+- `tract-onnx`: MIT or Apache-2.0; runs the checked-in ONNX models in Rust.
+- `rubato`: MIT or Apache-2.0; performs fixed-ratio high-quality resampling.
+
+`tools/gfx.py` reproduces the ONNX conversion from the official PyTorch files.
+Its Python packages are conversion-only dependencies.
 
 ## Layout
 
 - `app`: GPUI state and interface
 - `analysis`: decoding and signal metrics
+- `blind`: GFX preprocessing, inference, and pedal control mapping
 - `chain`: effect inference and parameter models
+- `models`: attributed inference weights
 - `assets`: embedded interface icons
 - `theme`: compact visual tokens
