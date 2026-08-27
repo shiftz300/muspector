@@ -116,11 +116,11 @@ impl Match {
         }
         Effect {
             kind: Kind::Drive,
-            model: Some(label.to_owned()),
+            model: Some(pedal(label).to_owned()),
             active: true,
             score: self.score,
             evidence: format!(
-                "GFX blind · {} high-energy window{} · guitar drive/fuzz model",
+                "GFX blind · {} high-energy window{}\nDrive / Fuzz model",
                 self.windows,
                 if self.windows == 1 { "" } else { "s" }
             ),
@@ -323,6 +323,25 @@ fn knob(name: &'static str, value: f64) -> Param {
     Param::new(name, value * 100.0, 0.0, 100.0, 1.0, "%")
 }
 
+fn pedal(label: &str) -> &'static str {
+    match label {
+        "808" => "Tube Screamer 808",
+        "BD2" => "Blues Driver",
+        "BMF" => "Big Muff",
+        "DPL" => "Distortion+",
+        "DS1" => "DS-1 Distortion",
+        "FFC" => "Fuzz Face",
+        "MGS" => "Grid Slammer",
+        "OD1" => "OD-1 OverDrive",
+        "RAT" => "RAT Distortion",
+        "RBM" => "Russian Big Muff",
+        "SD1" => "SD-1 Super OverDrive",
+        "TS9" => "Tube Screamer TS9",
+        "VTB" => "Tone Bender",
+        _ => "Drive",
+    }
+}
+
 fn gain_name(label: &str) -> &'static str {
     match label {
         "808" => "Overdrive",
@@ -388,5 +407,12 @@ mod tests {
                 .iter()
                 .all(|value| (0.0..=1.0).contains(value))
         );
+    }
+
+    #[test]
+    fn labels_are_presented_as_pedals() {
+        assert_eq!(pedal("RBM"), "Russian Big Muff");
+        assert_eq!(pedal("FFC"), "Fuzz Face");
+        assert_eq!(pedal("BD2"), "Blues Driver");
     }
 }

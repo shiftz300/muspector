@@ -1,0 +1,14 @@
+#!/bin/zsh
+set -euo pipefail
+
+root="${0:A:h:h}"
+app="$root/target/Muspector.app"
+
+cargo build --manifest-path "$root/Cargo.toml" --bin muspector
+mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+cp "$root/target/debug/muspector" "$app/Contents/MacOS/Muspector"
+cp "$root/bundle/Info.plist" "$app/Contents/Info.plist"
+cp "$root/assets/AppIcon.icns" "$app/Contents/Resources/AppIcon.icns"
+codesign --force --sign - "$app" >/dev/null
+
+open "$app" --args "$@"

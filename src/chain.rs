@@ -21,7 +21,7 @@ impl Kind {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Param {
     pub name: &'static str,
     pub value: f64,
@@ -82,7 +82,7 @@ impl Param {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Effect {
     pub kind: Kind,
     pub model: Option<String>,
@@ -98,7 +98,7 @@ impl Effect {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Chain {
     pub effects: Vec<Effect>,
     pub score: f64,

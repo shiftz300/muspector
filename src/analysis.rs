@@ -3,6 +3,7 @@ use crate::{
     chain::{self, Chain, Fingerprint},
 };
 use anyhow::{Context, Result, bail};
+use ebur128::{EbuR128, Mode};
 use realfft::{RealFftPlanner, RealToComplex};
 use std::{
     collections::VecDeque,
@@ -31,14 +32,14 @@ const FFT: usize = 4096;
 const HOP: usize = 2048;
 const FLOOR: f64 = 1.0e-12;
 const CHART: usize = 64;
-const LIMIT: usize = 4096;
-const POINTS: usize = 192;
+const LIMIT: usize = 32_768;
 
 #[derive(Clone, Debug)]
 pub struct Point {
     pub min: f32,
     pub max: f32,
     pub level: f64,
+    pub loudness: f64,
 }
 
 #[derive(Clone, Debug)]
@@ -55,6 +56,7 @@ pub struct Report {
     pub duration: f64,
     pub peak: f64,
     pub rms: f64,
+    pub loudness: f64,
     pub crest: f64,
     pub centroid: f64,
     pub rolloff: f64,
@@ -92,6 +94,17 @@ impl Report {
 }
 
 pub fn inspect(path: &Path) -> Result<Report> {
+    inspect_span(path, None)
+}
+
+pub fn inspect_range(path: &Path, start: f64, end: f64) -> Result<Report> {
+    if !start.is_finite() || !end.is_finite() || start < 0.0 || end <= start {
+        bail!("Invalid analysis range");
+    }
+    inspect_span(path, Some((start, end)))
+}
+
+fn inspect_span(path: &Path, span: Option<(f64, f64)>) -> Result<Report> {
     if !path.is_file() {
         bail!("请选择一个音频文件");
     }
@@ -135,8 +148,17 @@ pub fn inspect(path: &Path) -> Result<Report> {
     let mut peak = 0.0_f64;
     let mut clips = 0_u64;
     let mut scan = blind::Scan::new(rate);
+    let mut loudness =
+        EbuR128::new(channels as u32, rate, Mode::I).context("无法初始化响度分析器")?;
+    let from = span
+        .map(|(start, _)| (start * f64::from(rate)).floor() as u64)
+        .unwrap_or(0);
+    let to = span
+        .map(|(_, end)| (end * f64::from(rate)).ceil() as u64)
+        .unwrap_or(u64::MAX);
+    let mut decoded_frames = 0_u64;
 
-    loop {
+    'packets: loop {
         let packet = match format.next_packet() {
             Ok(packet) => packet,
             Err(Error::IoError(error)) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
@@ -159,9 +181,29 @@ pub fn inspect(path: &Path) -> Result<Report> {
         let buffer = sample_buffer.get_or_insert_with(|| SampleBuffer::<f32>::new(capacity, spec));
         buffer.copy_interleaved_ref(decoded);
         let samples = buffer.samples();
-        frames += (samples.len() / channels) as u64;
-
-        for frame in samples.chunks_exact(channels) {
+        let packet_frames = samples.len() / channels;
+        let packet_start = decoded_frames;
+        let packet_end = packet_start.saturating_add(packet_frames as u64);
+        decoded_frames = packet_end;
+        if packet_end <= from {
+            continue;
+        }
+        if packet_start >= to {
+            break;
+        }
+        let local_start = from.saturating_sub(packet_start).min(packet_frames as u64) as usize;
+        let local_end = to
+            .min(packet_end)
+            .saturating_sub(packet_start)
+            .min(packet_frames as u64) as usize;
+        let selected = &samples[local_start * channels..local_end * channels];
+        loudness.add_frames_f32(selected).context("响度分析失败")?;
+        let momentary = loudness
+            .loudness_momentary()
+            .unwrap_or(-72.0)
+            .clamp(-72.0, 0.0);
+        for frame in selected.chunks_exact(channels) {
+            frames += 1;
             let mut mono = 0.0_f32;
             for &sample in frame {
                 let value = f64::from(sample);
@@ -172,10 +214,13 @@ pub fn inspect(path: &Path) -> Result<Report> {
                 clips += u64::from(absolute >= 0.999_9);
                 mono += sample / channels as f32;
             }
-            timeline.push(mono);
+            timeline.push(mono, momentary);
             space.push(mono);
             signal.push(mono)?;
             scan.push(mono);
+        }
+        if packet_end >= to {
+            break 'packets;
         }
     }
 
@@ -184,6 +229,10 @@ pub fn inspect(path: &Path) -> Result<Report> {
     }
 
     let rms = (sum / count as f64).sqrt();
+    let loudness = loudness
+        .loudness_global()
+        .unwrap_or(-72.0)
+        .clamp(-72.0, 0.0);
     let spectrum = signal.finish()?;
     let profile = timeline.finish();
     let space = space.finish();
@@ -204,6 +253,7 @@ pub fn inspect(path: &Path) -> Result<Report> {
         duration: frames as f64 / rate as f64,
         peak: db(peak),
         rms: db(rms),
+        loudness,
         crest: db(peak) - db(rms),
         centroid: spectrum.centroid,
         rolloff: spectrum.rolloff,
@@ -222,6 +272,7 @@ struct Meter {
     min: f32,
     max: f32,
     square: f64,
+    loudness: f64,
     count: u64,
 }
 
@@ -231,14 +282,16 @@ impl Meter {
             min: 1.0,
             max: -1.0,
             square: 0.0,
+            loudness: 0.0,
             count: 0,
         }
     }
 
-    fn push(&mut self, sample: f32) {
+    fn push(&mut self, sample: f32, loudness: f64) {
         self.min = self.min.min(sample);
         self.max = self.max.max(sample);
         self.square += f64::from(sample) * f64::from(sample);
+        self.loudness += 10.0_f64.powf(loudness / 10.0);
         self.count += 1;
     }
 
@@ -253,6 +306,7 @@ impl Meter {
         self.min = self.min.min(other.min);
         self.max = self.max.max(other.max);
         self.square += other.square;
+        self.loudness += other.loudness;
         self.count += other.count;
     }
 
@@ -262,6 +316,7 @@ impl Meter {
                 min: 0.0,
                 max: 0.0,
                 level: -72.0,
+                loudness: -72.0,
             };
         }
         let rms = (self.square / self.count as f64).sqrt();
@@ -269,6 +324,7 @@ impl Meter {
             min: self.min,
             max: self.max,
             level: db(rms).clamp(-72.0, 0.0),
+            loudness: 10.0 * (self.loudness / self.count as f64).max(FLOOR).log10(),
         }
     }
 }
@@ -375,8 +431,8 @@ impl Timeline {
         }
     }
 
-    fn push(&mut self, sample: f32) {
-        self.meter.push(sample);
+    fn push(&mut self, sample: f32, loudness: f64) {
+        self.meter.push(sample, loudness);
         if self.meter.count >= self.span {
             self.bins.push(self.meter);
             self.meter = Meter::empty();
@@ -407,18 +463,7 @@ impl Timeline {
             return Profile { points: Vec::new() };
         }
 
-        let size = self.bins.len().div_ceil(POINTS).max(1);
-        let points = self
-            .bins
-            .chunks(size)
-            .map(|chunk| {
-                let mut meter = Meter::empty();
-                for item in chunk {
-                    meter.merge(*item);
-                }
-                meter.point()
-            })
-            .collect();
+        let points = self.bins.into_iter().map(Meter::point).collect();
         Profile { points }
     }
 }
@@ -718,12 +763,19 @@ mod tests {
         let mut timeline = Timeline::new(48_000);
         for index in 0..(48_000 * 240) {
             let phase = std::f32::consts::TAU * 220.0 * index as f32 / 48_000.0;
-            timeline.push(phase.sin() * 0.5);
+            timeline.push(phase.sin() * 0.5, -18.0);
         }
         let profile = timeline.finish();
         assert!(!profile.points.is_empty());
-        assert!(profile.points.len() <= POINTS);
+        assert!(profile.points.len() <= LIMIT);
+        assert!(profile.points.len() > 192);
         assert!(profile.points.iter().all(|point| point.level.is_finite()));
+        assert!(
+            profile
+                .points
+                .iter()
+                .all(|point| point.loudness.is_finite())
+        );
     }
 
     #[test]
@@ -753,6 +805,7 @@ mod tests {
         drop(file);
 
         let report = inspect(&path).unwrap();
+        let range = inspect_range(&path, 0.02, 0.05).unwrap();
         std::fs::remove_file(path).unwrap();
         assert_eq!(report.codec, "PCM");
         assert_eq!(report.rate, rate);
@@ -762,6 +815,8 @@ mod tests {
         assert_eq!(report.spectrum.len(), CHART);
         assert!(report.spectrum.iter().all(|value| value.is_finite()));
         assert!(!report.profile.points.is_empty());
-        assert!(report.profile.points.len() <= POINTS);
+        assert!(report.profile.points.len() <= LIMIT);
+        assert!((range.duration - 0.03).abs() < 0.001);
+        assert!((range.centroid - 440.0).abs() < 35.0);
     }
 }

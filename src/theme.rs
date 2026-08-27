@@ -14,7 +14,8 @@ pub const LINE: Rgba = color(0x353535);
 pub const ACCENT: Rgba = color(0xe58aae);
 pub const ACCENT_HOVER: Rgba = color(0xf09bbb);
 pub const ACCENT_SOFT: Rgba = color(0x38232e);
-pub const ON_ACCENT: Rgba = color(0x1d1117);
+pub const GOOD: Rgba = color(0x70b58a);
+pub const WARN: Rgba = color(0xd2aa65);
 pub const ERROR: Rgba = color(0xe0746a);
 
 const fn color(hex: u32) -> Rgba {

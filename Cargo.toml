@@ -8,7 +8,8 @@ description = "A compact audio inspector built with GPUI"
 
 [dependencies]
 anyhow = "1.0"
-gpui = { version = "0.2.2", default-features = false, features = ["font-kit", "macos-blade"] }
+ebur128 = "0.1.10"
+gpui = { git = "https://github.com/zed-industries/zed", rev = "ac2f097559ecbaab6f55ca5a519f53b80ac54afb", default-features = false, features = ["font-kit"] }
 realfft = "3.5"
 rubato = "4.0.0"
 symphonia = { version = "0.5.5", default-features = false, features = [
@@ -22,7 +23,11 @@ symphonia = { version = "0.5.5", default-features = false, features = [
     "vorbis",
     "wav",
 ] }
+sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }
 tract-onnx = "0.23.4"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+gpui_macos = { git = "https://github.com/zed-industries/zed", rev = "ac2f097559ecbaab6f55ca5a519f53b80ac54afb", default-features = false, features = ["font-kit", "runtime_shaders"] }
 
 [profile.dev]
 opt-level = 1
