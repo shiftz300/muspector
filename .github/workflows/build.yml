@@ -29,16 +29,19 @@ jobs:
             runner: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             source: target/x86_64-unknown-linux-gnu/release/muspector
+            asset: muspector-linux-x86_64
             artifact: dist/muspector-linux-x86_64
           - name: Windows x86_64
             runner: windows-2025
             target: x86_64-pc-windows-msvc
             source: target/x86_64-pc-windows-msvc/release/muspector.exe
+            asset: muspector-windows-x86_64.exe
             artifact: dist/muspector-windows-x86_64.exe
           - name: macOS arm64
             runner: macos-15
             target: aarch64-apple-darwin
             source: target/aarch64-apple-darwin/release/muspector
+            asset: muspector-macos-arm64
             artifact: dist/muspector-macos-arm64
 
     runs-on: ${{ matrix.runner }}
@@ -83,15 +86,77 @@ jobs:
         run: codesign --force --sign - --timestamp=none "${{ matrix.artifact }}"
 
       - name: Record executable size
+        if: runner.os != 'Windows'
         shell: bash
         run: |
           ls -lh "${{ matrix.artifact }}"
           shasum -a 256 "${{ matrix.artifact }}"
 
+      - name: Record executable size on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Get-Item "${{ matrix.artifact }}" | Format-List Name, Length
+          Get-FileHash "${{ matrix.artifact }}" -Algorithm SHA256
+
       - name: Upload single executable
         uses: actions/upload-artifact@v7
         with:
+          name: ${{ matrix.asset }}
           path: ${{ matrix.artifact }}
           archive: false
           if-no-files-found: error
           retention-days: 30
+
+  release:
+    name: Publish latest release
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Download executables
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+          pattern: muspector-*
+          merge-multiple: true
+
+      - name: Verify release assets
+        shell: bash
+        run: |
+          test -f dist/muspector-linux-x86_64
+          test -f dist/muspector-windows-x86_64.exe
+          test -f dist/muspector-macos-arm64
+
+      - name: Publish rolling latest release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git tag --force latest "$GITHUB_SHA"
+          git push --force origin refs/tags/latest
+
+          if gh release view latest >/dev/null 2>&1; then
+            gh release edit latest \
+              --title "Latest build" \
+              --target "$GITHUB_SHA" \
+              --latest \
+              --notes "Automated build from $GITHUB_SHA."
+          else
+            gh release create latest \
+              --verify-tag \
+              --title "Latest build" \
+              --target "$GITHUB_SHA" \
+              --latest \
+              --notes "Automated build from $GITHUB_SHA."
+          fi
+
+          gh release upload latest dist/* --clobber

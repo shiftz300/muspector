@@ -69,6 +69,10 @@ in its native PE resources. macOS artifacts are ad-hoc signed; downloaded Linux
 and macOS artifacts may need their executable permission restored with
 `chmod +x` depending on the download client.
 
+Successful `main` builds also update the rolling `latest` tag and Release. Its
+three stable asset names are replaced on every successful run, so the Release
+always points to the executables built from the current `main` commit.
+
 For a manual UI check, run `cargo dev` and verify that:
 
 1. Open launches the file picker and its hover state fades smoothly.
