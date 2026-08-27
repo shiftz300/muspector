@@ -45,6 +45,7 @@ impl AssetSource for Assets {
             return Ok(Some(Cow::Owned(svg.into_bytes())));
         }
         match path {
+            "AppIcon.png" => Ok(Some(Cow::Borrowed(include_bytes!("../assets/AppIcon.png")))),
             "icons/audio.svg" => Ok(Some(Cow::Borrowed(include_bytes!(
                 "../assets/icons/audio.svg"
             )))),
@@ -66,6 +67,7 @@ impl AssetSource for Assets {
 
     fn list(&self, path: &str) -> Result<Vec<SharedString>> {
         Ok(match path {
+            "" => vec!["AppIcon.png".into()],
             "icons" => vec![
                 "icons/audio.svg".into(),
                 "icons/undo.svg".into(),

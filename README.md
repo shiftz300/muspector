@@ -9,8 +9,11 @@ deferred.
 
 ## Requirements
 
-- macOS
 - Rust 1.96 or newer
+- macOS, Windows, or a Vulkan-capable X11/Wayland Linux desktop
+
+The CI artifacts currently target Apple silicon macOS, x86-64 Windows, and
+x86-64 Linux.
 
 ## Run
 
@@ -48,6 +51,23 @@ cargo check
 cargo test
 cargo clippy --all-targets -- -D warnings
 ```
+
+## CI executables
+
+The `Build` workflow compiles native optimized executables on three GitHub-hosted
+runners and uploads each result as a single, unwrapped artifact:
+
+- `muspector-linux-x86_64`
+- `muspector-windows-x86_64.exe`
+- `muspector-macos-arm64`
+
+Release builds use `opt-level=3`, fat LTO, one codegen unit, aborted panics, and
+symbol stripping to keep model inference and visualization hot paths fast while
+removing avoidable binary overhead. All GPUI assets and the application PNG are
+compiled into the executable. Windows also embeds the icon and product metadata
+in its native PE resources. macOS artifacts are ad-hoc signed; downloaded Linux
+and macOS artifacts may need their executable permission restored with
+`chmod +x` depending on the download client.
 
 For a manual UI check, run `cargo dev` and verify that:
 

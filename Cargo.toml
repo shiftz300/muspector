@@ -5,11 +5,13 @@ edition = "2024"
 rust-version = "1.96"
 license = "Apache-2.0"
 description = "A compact audio inspector built with GPUI"
+build = "build.rs"
 
 [dependencies]
 anyhow = "1.0"
 ebur128 = "0.1.10"
 gpui = { git = "https://github.com/zed-industries/zed", rev = "ac2f097559ecbaab6f55ca5a519f53b80ac54afb", default-features = false, features = ["font-kit"] }
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "ac2f097559ecbaab6f55ca5a519f53b80ac54afb", default-features = false, features = ["font-kit", "runtime_shaders", "wayland", "x11"] }
 realfft = "3.5"
 rubato = "4.0.0"
 symphonia = { version = "0.5.5", default-features = false, features = [
@@ -26,8 +28,8 @@ symphonia = { version = "0.5.5", default-features = false, features = [
 sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }
 tract-onnx = "0.23.4"
 
-[target.'cfg(target_os = "macos")'.dependencies]
-gpui_macos = { git = "https://github.com/zed-industries/zed", rev = "ac2f097559ecbaab6f55ca5a519f53b80ac54afb", default-features = false, features = ["font-kit", "runtime_shaders"] }
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
 
 [profile.dev]
 opt-level = 1
@@ -36,8 +38,12 @@ opt-level = 1
 opt-level = 2
 
 [profile.release]
-lto = "thin"
-strip = true
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+incremental = false
 
 [lints.rust]
 unsafe_code = "forbid"
