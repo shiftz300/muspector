@@ -55,12 +55,34 @@ impl AssetSource for Assets {
             "icons/redo.svg" => Ok(Some(Cow::Borrowed(include_bytes!(
                 "../assets/icons/redo.svg"
             )))),
+            "icons/play.svg" => Ok(Some(Cow::Borrowed(include_bytes!(
+                "../assets/icons/play.svg"
+            )))),
+            "icons/pause.svg" => Ok(Some(Cow::Borrowed(include_bytes!(
+                "../assets/icons/pause.svg"
+            )))),
+            "icons/rotate-cw.svg" => Ok(Some(Cow::Borrowed(include_bytes!(
+                "../assets/icons/rotate-cw.svg"
+            )))),
             "icons/chevron-up.svg" => Ok(Some(Cow::Borrowed(include_bytes!(
                 "../assets/icons/chevron-up.svg"
             )))),
             "icons/chevron-down.svg" => Ok(Some(Cow::Borrowed(include_bytes!(
                 "../assets/icons/chevron-down.svg"
             )))),
+            "icons/chevron-left.svg" => Ok(Some(Cow::Borrowed(include_bytes!(
+                "../assets/icons/chevron-left.svg"
+            )))),
+            "icons/chevron-right.svg" => Ok(Some(Cow::Borrowed(include_bytes!(
+                "../assets/icons/chevron-right.svg"
+            )))),
+            "icons/plus.svg" => Ok(Some(Cow::Borrowed(include_bytes!(
+                "../assets/icons/plus.svg"
+            )))),
+            "icons/minus.svg" => Ok(Some(Cow::Borrowed(include_bytes!(
+                "../assets/icons/minus.svg"
+            )))),
+            "icons/x.svg" => Ok(Some(Cow::Borrowed(include_bytes!("../assets/icons/x.svg")))),
             _ => Ok(None),
         }
     }
@@ -72,8 +94,16 @@ impl AssetSource for Assets {
                 "icons/audio.svg".into(),
                 "icons/undo.svg".into(),
                 "icons/redo.svg".into(),
+                "icons/play.svg".into(),
+                "icons/pause.svg".into(),
+                "icons/rotate-cw.svg".into(),
                 "icons/chevron-up.svg".into(),
                 "icons/chevron-down.svg".into(),
+                "icons/chevron-left.svg".into(),
+                "icons/chevron-right.svg".into(),
+                "icons/plus.svg".into(),
+                "icons/minus.svg".into(),
+                "icons/x.svg".into(),
             ],
             _ => Vec::new(),
         })

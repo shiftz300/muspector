@@ -4,8 +4,8 @@ Muspector is a compact GPUI audio inspector for studying guitar tones. The
 current MVP performs local analysis, uses GFX Classifier to identify a likely
 drive/fuzz unit and its controls, and proposes an editable hybrid effect chain.
 The landscape workspace combines an RX-style analysis canvas with an
-Ableton-inspired horizontal device chain. Audio playback is intentionally
-deferred.
+Ableton-inspired horizontal device chain. A lightweight local transport previews
+the original audio without applying the proposed chain.
 
 ## Requirements
 
@@ -91,28 +91,31 @@ For a manual UI check, run `cargo dev` and verify that:
    The Overview viewport pans from its center and its `<` / `>` edges resize the
    visible range. Alt + wheel changes the vertical waveform scale.
    Command/Control + `+`, `-`, and `0` provide keyboard zoom controls.
-8. The bottom Signal Chain is horizontally scrollable. Dragging anywhere on a
+8. The Workspace Play button and Space pause or resume the original audio. A
+   click fixes the pink playhead at that time; dragging creates a selection, and
+   the adjacent Loop button repeats that selected range.
+9. The bottom Signal Chain is horizontally scrollable. Dragging anywhere on a
    device, including its expanded details, moves the complete card, leaves a
    muted placeholder, and reorders the surrounding devices as they make room.
    Reset restores the inferred order.
-9. The compact pink or gray status dot and disclosure control share the top row
+10. The compact pink or gray status dot and disclosure control share the top row
    of each narrow device label. Number, effect type, and confidence use a tight
    horizontal hierarchy; only a distinct detected model uses a rotated vertical
    label, with long names wrapped into adjacent columns. Expanding or collapsing
    full-width parameter controls is smooth.
-10. Plus/minus controls and scrolling over a knob update its parameters.
+11. Plus/minus controls and scrolling over a knob update its parameters.
    Clicking a value allows direct numeric entry; Enter commits, Escape cancels,
    and Reset restores the inferred values. Each knob shows the detected value
    as a muted scale marker; double-clicking the knob restores only that
    parameter to the marker.
-11. Effect cards fade without changing title geometry when enabled or disabled.
-12. The window cannot shrink below the safe editor width, and the device rack
+12. Effect cards fade without changing title geometry when enabled or disabled.
+13. The window cannot shrink below the safe editor width, and the device rack
     keeps readable parameter values while its horizontal indicator follows the
     visible position.
-13. The upper-right CPU and RAM pressure strips update without interrupting the
+14. The upper-right CPU and RAM pressure strips update without interrupting the
     editor; inactive segments are gray and active pressure progresses through
     green, amber, and red.
-14. The right-side History menu lists document-local chain changes. Clicking an
+15. The right-side History menu lists document-local chain changes. Clicking an
     entry jumps to that state; Command/Control + Z undoes and
     Command/Control + Shift + Z redoes. Consecutive knob adjustments and one
     card drag are each grouped into a single history step.
@@ -152,6 +155,10 @@ render-and-compare analysis is planned around StemFX after the blind workflow.
 - `tract-onnx`: MIT or Apache-2.0; runs the checked-in ONNX models in Rust.
 - `rubato`: MIT or Apache-2.0; performs fixed-ratio high-quality resampling.
 - `ebur128`: MIT; performs EBU R128 / ITU-R BS.1770 loudness analysis.
+- `rodio`: MIT or Apache-2.0; provides native preview output while sharing the
+  existing Symphonia 0.5.5 decoding stack.
+- Lucide: ISC; supplies the small embedded interface icon set. Attribution and
+  the license text are in `assets/icons/LUCIDE.md`.
 - `sysinfo`: MIT; samples only system CPU and memory data for the header pressure
   strips, with its default multithreading disabled.
 

@@ -1,14 +1,18 @@
 use crate::{
     analysis::{self, Report},
+    audio::Audio,
     chain::{Chain, Effect, Param},
+    icon::Icon,
     theme,
 };
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use gpui::PinchEvent;
 use gpui::{
     Animation, AnimationExt, AnyElement, App, AppContext, BorderStyle, Bounds, ClickEvent, Context,
     Corners, DispatchPhase, Div, DragMoveEvent, Edges, Element, ElementId, ExternalPaths,
     FocusHandle, GlobalElementId, Hitbox, HitboxBehavior, InspectorElementId, IntoElement,
     KeyDownEvent, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathBuilder,
-    PathPromptOptions, PinchEvent, Pixels, Point, Position, PromptLevel, Render, ScrollHandle,
+    PathPromptOptions, Pixels, Point, Position, PromptLevel, Render, ScrollHandle,
     ScrollWheelEvent, Style, Styled, Transformation, Window, canvas, div, ease_in_out, point,
     prelude::*, px, quad, radians, relative, size, svg, transparent_black,
 };
@@ -16,7 +20,7 @@ use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Duration;
-use sysinfo::System;
+use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 
 const TINT: Duration = Duration::from_millis(140);
 const CARD: Duration = Duration::from_millis(180);
@@ -442,7 +446,14 @@ impl Render for EffectDrag {
                                             .flex()
                                             .items_center()
                                             .justify_center()
-                                            .child(if self.expanded { "‹" } else { "›" }),
+                                            .child(
+                                                if self.expanded {
+                                                    Icon::Left
+                                                } else {
+                                                    Icon::Right
+                                                }
+                                                .draw(px(11.0), theme::MUTED),
+                                            ),
                                     ),
                             )
                             .child(
@@ -521,6 +532,10 @@ pub struct Muspector {
     alert: Option<Alert>,
     notice: usize,
     cursor: Option<f32>,
+    playhead: Option<f32>,
+    audio: Option<Audio>,
+    looped: bool,
+    playback: usize,
     selection: Option<(f32, f32)>,
     drag: Option<f32>,
     pan: Option<(f32, f32)>,
@@ -566,6 +581,10 @@ impl Muspector {
             alert: None,
             notice: 0,
             cursor: None,
+            playhead: None,
+            audio: None,
+            looped: false,
+            playback: 0,
             selection: None,
             drag: None,
             pan: None,
@@ -611,8 +630,8 @@ impl Muspector {
         cx.spawn(async move |view, cx| {
             let task = cx.background_spawn(async move {
                 let mut system = System::new();
-                system.refresh_cpu_usage();
                 system.refresh_memory();
+                refresh_process(&mut system);
                 system
             });
             let mut system = task.await;
@@ -620,17 +639,8 @@ impl Muspector {
             loop {
                 cx.background_executor().timer(Duration::from_secs(1)).await;
                 let task = cx.background_spawn(async move {
-                    system.refresh_cpu_usage();
                     system.refresh_memory();
-                    let total = system.total_memory();
-                    let pressure = Pressure {
-                        cpu: pressure_level(system.global_cpu_usage()),
-                        ram: if total == 0 {
-                            0
-                        } else {
-                            pressure_level(system.used_memory() as f32 / total as f32 * 100.0)
-                        },
-                    };
+                    let pressure = refresh_process(&mut system);
                     (system, pressure)
                 });
                 let result = task.await;
@@ -805,7 +815,11 @@ impl Muspector {
     }
 
     fn reset_editor(&mut self) {
+        self.playback = self.playback.wrapping_add(1);
+        self.audio = None;
         self.cursor = None;
+        self.playhead = None;
+        self.looped = false;
         self.selection = None;
         self.drag = None;
         self.pan = None;
@@ -831,6 +845,163 @@ impl Muspector {
             ScrollHandle::new(),
             ScrollHandle::new(),
         ];
+    }
+
+    fn seek(&mut self, position: f32, cx: &mut Context<Self>) {
+        let position = position.clamp(0.0, 1.0);
+        self.playhead = Some(position);
+        let Some((path, duration)) = (match &self.state {
+            State::Ready(report) => Some((report.path.clone(), report.duration)),
+            State::Empty | State::Loading(_) => None,
+        }) else {
+            return;
+        };
+        let result = self.audio.as_ref().and_then(|audio| {
+            audio
+                .matches(&path)
+                .then(|| audio.seek(Duration::from_secs_f64(duration * f64::from(position))))
+        });
+        if let Some(Err(error)) = result {
+            self.audio = None;
+            self.warn(format!("Could not seek: {error}"), cx);
+        } else {
+            cx.notify();
+        }
+    }
+
+    fn toggle_play(&mut self, cx: &mut Context<Self>) {
+        let Some((path, duration)) = (match &self.state {
+            State::Ready(report) => Some((report.path.clone(), report.duration)),
+            State::Empty | State::Loading(_) => None,
+        }) else {
+            return;
+        };
+        if duration <= f64::EPSILON {
+            self.warn("This file has no playable duration".to_owned(), cx);
+            return;
+        }
+
+        if let Some(audio) = &self.audio
+            && audio.matches(&path)
+            && !audio.paused()
+        {
+            audio.pause();
+            self.playback = self.playback.wrapping_add(1);
+            cx.notify();
+            return;
+        }
+
+        let replace = self
+            .audio
+            .as_ref()
+            .is_none_or(|audio| !audio.matches(&path) || audio.empty());
+        if replace {
+            let mut position = self.playhead.unwrap_or(0.0).clamp(0.0, 1.0);
+            if self.looped
+                && let Some((start, end)) = self.selection.map(|range| ordered(range.0, range.1))
+                && (position < start || position >= end)
+            {
+                position = start;
+            }
+            match Audio::open(
+                &path,
+                Duration::from_secs_f64(duration * f64::from(position)),
+            ) {
+                Ok(audio) => self.audio = Some(audio),
+                Err(error) => {
+                    self.warn(format!("Could not play: {error}"), cx);
+                    return;
+                }
+            }
+        }
+
+        if let Some(audio) = &self.audio {
+            audio.play();
+            self.playhead =
+                Some((audio.position().as_secs_f64() / duration).clamp(0.0, 1.0) as f32);
+        }
+        self.watch(cx);
+        cx.notify();
+    }
+
+    fn toggle_loop(&mut self, cx: &mut Context<Self>) {
+        let Some((start, end)) = self.selection.map(|range| ordered(range.0, range.1)) else {
+            self.warn("Drag across the waveform to select a loop".to_owned(), cx);
+            return;
+        };
+        if end - start <= f32::EPSILON {
+            self.warn("Select a longer range to loop".to_owned(), cx);
+            return;
+        }
+        self.looped = !self.looped;
+        if self.looped
+            && self
+                .playhead
+                .is_none_or(|position| position < start || position >= end)
+        {
+            self.seek(start, cx);
+        } else {
+            cx.notify();
+        }
+    }
+
+    fn watch(&mut self, cx: &mut Context<Self>) {
+        self.playback = self.playback.wrapping_add(1);
+        let playback = self.playback;
+        cx.spawn(async move |view, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(33))
+                    .await;
+                let active = view
+                    .update(cx, |this, cx| {
+                        if this.playback != playback {
+                            return false;
+                        }
+                        let State::Ready(report) = &this.state else {
+                            return false;
+                        };
+                        let duration = report.duration;
+                        let path = report.path.clone();
+                        let Some(audio) = &this.audio else {
+                            return false;
+                        };
+                        if !audio.matches(&path) || audio.paused() {
+                            return false;
+                        }
+
+                        let mut seconds = audio.position().as_secs_f64();
+                        if this.looped
+                            && let Some((start, end)) =
+                                this.selection.map(|range| ordered(range.0, range.1))
+                        {
+                            let start = duration * f64::from(start);
+                            let end = duration * f64::from(end);
+                            if seconds >= end || seconds < start {
+                                if audio.seek(Duration::from_secs_f64(start)).is_err() {
+                                    this.looped = false;
+                                } else {
+                                    seconds = start;
+                                }
+                            }
+                        }
+
+                        let ended = audio.empty() || seconds >= duration;
+                        this.playhead = Some(if ended {
+                            1.0
+                        } else {
+                            (seconds / duration).clamp(0.0, 1.0) as f32
+                        });
+                        cx.notify();
+                        !ended
+                    })
+                    .unwrap_or(false);
+                if !active {
+                    break;
+                }
+            }
+        })
+        .detach();
     }
 
     fn sync_active(&mut self) {
@@ -1532,6 +1703,15 @@ impl Muspector {
             return;
         }
         if self.edit.is_none() {
+            if !command
+                && !event.keystroke.modifiers.alt
+                && !event.keystroke.modifiers.shift
+                && matches!(event.keystroke.key.as_str(), "space" | " ")
+            {
+                self.toggle_play(cx);
+                cx.stop_propagation();
+                return;
+            }
             if command {
                 match event.keystroke.key.as_str() {
                     "=" | "+" => self.scale(1.25, 0.5, cx),
@@ -1796,6 +1976,7 @@ impl Muspector {
                             ),
                     ),
             )
+            .child(self.transport(report, cx))
             .child(self.chain(report, cx))
             .into_any_element()
     }
@@ -1926,7 +2107,11 @@ impl Muspector {
                         cx.stop_propagation();
                         this.close(index, window, cx);
                     }))
-                    .child("×"),
+                    .child(
+                        Icon::Close
+                            .draw(px(12.0), theme::MUTED)
+                            .hover(|icon| icon.text_color(theme::INK)),
+                    ),
             )
             .into_any_element()
     }
@@ -1946,7 +2131,7 @@ impl Muspector {
                 this.hover(OPEN, *hovered, cx);
             }))
             .on_click(cx.listener(|this, _event, _window, cx| this.pick(cx)))
-            .child("+");
+            .child(Icon::Add.draw(px(14.0), theme::MUTED));
         let button = match self.hovers[OPEN] {
             Hover::Idle => button.into_any_element(),
             Hover::Over => button
@@ -2511,7 +2696,11 @@ impl Muspector {
                         cx.stop_propagation();
                         this.undo(cx);
                     }))
-                    .child(svg().size(px(13.0)).path("icons/undo.svg")),
+                    .child(
+                        Icon::Undo
+                            .draw(px(13.0), theme::MUTED)
+                            .hover(|icon| icon.text_color(theme::INK)),
+                    ),
             )
             .child(
                 div()
@@ -2533,7 +2722,11 @@ impl Muspector {
                         cx.stop_propagation();
                         this.redo(cx);
                     }))
-                    .child(svg().size(px(13.0)).path("icons/redo.svg")),
+                    .child(
+                        Icon::Redo
+                            .draw(px(13.0), theme::MUTED)
+                            .hover(|icon| icon.text_color(theme::INK)),
+                    ),
             )
             .child(
                 div()
@@ -2543,11 +2736,14 @@ impl Muspector {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .child(svg().size(px(12.0)).path(if self.history_open {
-                        "icons/chevron-down.svg"
-                    } else {
-                        "icons/chevron-up.svg"
-                    })),
+                    .child(
+                        if self.history_open {
+                            Icon::Down
+                        } else {
+                            Icon::Up
+                        }
+                        .draw(px(12.0), theme::FAINT),
+                    ),
             );
 
         let list = div().w_full().flex_none().overflow_hidden().child(list);
@@ -2597,6 +2793,7 @@ impl Muspector {
             compact(&points[first.min(last)..=final_index.min(last)], 2_048)
         };
         let cursor = self.cursor;
+        let playhead = self.playhead;
         let selection = self.selection;
         let bounds: Rc<RefCell<Option<Bounds<Pixels>>>> = Rc::new(RefCell::new(None));
         let capture = bounds.clone();
@@ -2604,6 +2801,7 @@ impl Muspector {
         let begin = bounds.clone();
         let pan_begin = bounds.clone();
         let wheel = bounds.clone();
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         let pinch = bounds.clone();
 
         let detail = selection
@@ -2810,6 +3008,30 @@ impl Muspector {
                                 window.paint_path(path, theme::INK);
                             }
                         }
+
+                        if let Some(position) = playhead
+                            && (view..=view + visible).contains(&position)
+                        {
+                            let x = left + width * ((position - view) / visible);
+                            let mut marker = PathBuilder::stroke(px(1.5));
+                            marker.move_to(point(x, top));
+                            marker.line_to(point(x, bottom));
+                            if let Ok(path) = marker.build() {
+                                window.paint_path(path, theme::ACCENT);
+                            }
+                            let mut head = PathBuilder::fill();
+                            head.add_polygon(
+                                &[
+                                    point(x - px(4.0), top),
+                                    point(x + px(4.0), top),
+                                    point(x, top + px(6.0)),
+                                ],
+                                true,
+                            );
+                            if let Ok(path) = head.build() {
+                                window.paint_path(path, theme::ACCENT);
+                            }
+                        }
                     },
                 )
                 .size_full(),
@@ -2912,11 +3134,13 @@ impl Muspector {
                 MouseButton::Left,
                 cx.listener(move |this, _: &MouseUpEvent, _, cx| {
                     this.drag = None;
-                    if this
-                        .selection
-                        .is_some_and(|(start, end)| (end - start).abs() <= minimum)
+                    if let Some((start, end)) = this.selection
+                        && (end - start).abs() <= minimum
                     {
                         this.selection = None;
+                        this.looped = false;
+                        this.seek((start + end) * 0.5, cx);
+                        return;
                     }
                     cx.notify();
                 }),
@@ -2996,23 +3220,26 @@ impl Muspector {
                 }
                 cx.stop_propagation();
                 cx.notify();
-            }))
-            .on_pinch(cx.listener(move |this, event: &PinchEvent, _, cx| {
-                let Some(area) = *pinch.borrow() else {
-                    return;
-                };
-                if event.delta.abs() <= f32::EPSILON {
-                    return;
-                }
-                let anchor = horizontal(event.position.x, area);
-                this.scale((1.0 + event.delta).max(0.05), anchor, cx);
-                cx.stop_propagation();
-            }))
-            .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
-                if !hovered && this.cursor.take().is_some() {
-                    cx.notify();
-                }
             }));
+
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        let plot = plot.on_pinch(cx.listener(move |this, event: &PinchEvent, _, cx| {
+            let Some(area) = *pinch.borrow() else {
+                return;
+            };
+            if event.delta.abs() <= f32::EPSILON {
+                return;
+            }
+            let anchor = horizontal(event.position.x, area);
+            this.scale((1.0_f32 + event.delta).max(0.05_f32), anchor, cx);
+            cx.stop_propagation();
+        }));
+
+        let plot = plot.on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+            if !hovered && this.cursor.take().is_some() {
+                cx.notify();
+            }
+        }));
 
         let mut marks = Vec::new();
         for (index, db) in [
@@ -3100,6 +3327,126 @@ impl Muspector {
                     .child(div().text_xs().text_color(theme::MUTED).child(detail)),
             )
             .child(chart)
+            .into_any_element()
+    }
+
+    fn transport(&self, report: &Report, cx: &mut Context<Self>) -> AnyElement {
+        let playing = self
+            .audio
+            .as_ref()
+            .is_some_and(|audio| !audio.paused() && !audio.empty());
+        let loop_available = self
+            .selection
+            .is_some_and(|(start, end)| (end - start).abs() > f32::EPSILON);
+        let position = self.playhead.unwrap_or(0.0).clamp(0.0, 1.0);
+        let selection = self
+            .selection
+            .filter(|(start, end)| (end - start).abs() > f32::EPSILON)
+            .map(|range| ordered(range.0, range.1))
+            .map(|(start, end)| {
+                format!(
+                    "Loop {} – {}",
+                    stamp(report.duration * f64::from(start)),
+                    stamp(report.duration * f64::from(end))
+                )
+            });
+
+        div()
+            .id("transport")
+            .h(px(34.0))
+            .min_h(px(34.0))
+            .w_full()
+            .relative()
+            .border_t_1()
+            .border_b_1()
+            .border_color(theme::LINE)
+            .bg(theme::PANEL)
+            .child(
+                div()
+                    .absolute()
+                    .left_2()
+                    .top_0()
+                    .bottom_0()
+                    .whitespace_nowrap()
+                    .text_xs()
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(theme::INK)
+                    .flex()
+                    .items_center()
+                    .child(format!(
+                        "{} / {}",
+                        stamp(report.duration * f64::from(position)),
+                        stamp(report.duration)
+                    )),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .left(relative(0.5))
+                    .top(px(4.0))
+                    .ml(px(-26.0))
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .child(
+                        div()
+                            .id("playback")
+                            .size(px(24.0))
+                            .rounded(theme::RADIUS)
+                            .bg(if playing {
+                                theme::ACCENT_SOFT
+                            } else {
+                                theme::TRACK
+                            })
+                            .text_color(theme::INK)
+                            .cursor_pointer()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .hover(|style| style.bg(theme::HOVER))
+                            .on_click(cx.listener(|this, _, _, cx| this.toggle_play(cx)))
+                            .child(
+                                if playing { Icon::Pause } else { Icon::Play }
+                                    .draw(px(13.0), theme::INK),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("loop")
+                            .size(px(24.0))
+                            .rounded(theme::RADIUS)
+                            .opacity(if loop_available { 1.0 } else { 0.42 })
+                            .bg(if self.looped {
+                                theme::ACCENT_SOFT
+                            } else {
+                                theme::TRACK
+                            })
+                            .text_color(theme::INK)
+                            .cursor_pointer()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .hover(|style| style.bg(theme::HOVER))
+                            .on_click(cx.listener(|this, _, _, cx| this.toggle_loop(cx)))
+                            .child(Icon::Loop.draw(px(13.0), theme::INK)),
+                    ),
+            )
+            .children(selection.map(|selection| {
+                div()
+                    .absolute()
+                    .right_2()
+                    .top_0()
+                    .bottom_0()
+                    .text_xs()
+                    .text_color(if self.looped {
+                        theme::ACCENT
+                    } else {
+                        theme::MUTED
+                    })
+                    .flex()
+                    .items_center()
+                    .child(selection)
+            }))
             .into_any_element()
     }
 
@@ -3424,7 +3771,18 @@ impl Muspector {
                                     .on_click(cx.listener(move |this, _event, _window, cx| {
                                         this.expand(index, cx);
                                     }))
-                                    .child(if expanded { "‹" } else { "›" }),
+                                    .child(
+                                        if expanded { Icon::Left } else { Icon::Right }
+                                            .draw(
+                                                px(11.0),
+                                                if expanded {
+                                                    theme::ACCENT
+                                                } else {
+                                                    theme::MUTED
+                                                },
+                                            )
+                                            .hover(|icon| icon.text_color(theme::INK)),
+                                    ),
                             ),
                     )
                     .child(
@@ -3900,7 +4258,7 @@ fn knob(
                 .items_center()
                 .justify_between()
                 .gap_1()
-                .child(step(effect, index, -1.0, "−", cx))
+                .child(step(effect, index, -1.0, cx))
                 .child(
                     div()
                         .id(("value", effect * 100 + index))
@@ -3918,18 +4276,12 @@ fn knob(
                         }))
                         .child(value),
                 )
-                .child(step(effect, index, 1.0, "+", cx)),
+                .child(step(effect, index, 1.0, cx)),
         )
         .into_any_element()
 }
 
-fn step(
-    effect: usize,
-    param: usize,
-    direction: f64,
-    label: &'static str,
-    cx: &mut Context<Muspector>,
-) -> AnyElement {
+fn step(effect: usize, param: usize, direction: f64, cx: &mut Context<Muspector>) -> AnyElement {
     div()
         .id((
             "step",
@@ -3948,7 +4300,15 @@ fn step(
         .on_click(cx.listener(move |this, _event, _window, cx| {
             this.adjust(effect, param, direction, cx);
         }))
-        .child(label)
+        .child(
+            if direction > 0.0 {
+                Icon::Add
+            } else {
+                Icon::Remove
+            }
+            .draw(px(10.0), theme::MUTED)
+            .hover(|icon| icon.text_color(theme::INK)),
+        )
         .into_any_element()
 }
 
@@ -4202,6 +4562,78 @@ fn pressure_level(value: f32) -> usize {
         2
     } else {
         3
+    }
+}
+
+fn refresh_process(system: &mut System) -> Pressure {
+    let pid = Pid::from_u32(std::process::id());
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[pid]),
+        false,
+        ProcessRefreshKind::nothing().with_cpu().with_memory(),
+    );
+    let Some(process) = system.process(pid) else {
+        return Pressure::default();
+    };
+
+    let cores = std::thread::available_parallelism()
+        .map(|cores| cores.get())
+        .unwrap_or(1) as f32;
+    let cpu = (process.cpu_usage() / cores).clamp(0.0, 100.0);
+    let (available, capacity) = memory_headroom(system, process.memory());
+
+    Pressure {
+        cpu: pressure_level(cpu),
+        ram: memory_level(available, capacity),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn memory_headroom(system: &System, process_memory: u64) -> (u64, u64) {
+    // XNU's available-memory metric includes reclaimable pages. Adding the
+    // process RSS yields the capacity the process could occupy before that
+    // current headroom is exhausted.
+    let available = system.available_memory();
+    (available, available.saturating_add(process_memory))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn memory_headroom(system: &System, process_memory: u64) -> (u64, u64) {
+    #[cfg(target_os = "linux")]
+    if let Some(limits) = system.cgroup_limits()
+        && limits.total_memory > 0
+        && limits.total_memory < system.total_memory()
+    {
+        return (
+            limits.total_memory.saturating_sub(process_memory),
+            limits.total_memory,
+        );
+    }
+
+    let total = system.total_memory();
+    (total.saturating_sub(process_memory), total)
+}
+
+fn memory_level(available: u64, total: u64) -> usize {
+    const GIB: u64 = 1_024 * 1_024 * 1_024;
+
+    if total == 0 {
+        return 0;
+    }
+
+    // Base memory pressure on the process's remaining headroom instead of
+    // system-wide "used" RAM. The absolute caps prevent large-memory machines
+    // from turning red while several GiB remain.
+    let available = available.min(total);
+    let critical = (total / 16).min(GIB);
+    let warning = (total / 5).min(4 * GIB);
+
+    if available <= critical {
+        3
+    } else if available <= warning {
+        2
+    } else {
+        1
     }
 }
 
@@ -4475,5 +4907,24 @@ mod tests {
         );
         assert_eq!(history.entries.len(), 2);
         assert_eq!(history.entries[1].label, "Enable Gate");
+    }
+
+    #[test]
+    fn memory_pressure_uses_remaining_headroom() {
+        const GIB: u64 = 1_024 * 1_024 * 1_024;
+
+        assert_eq!(memory_level(10 * GIB, 16 * GIB), 1);
+        assert_eq!(memory_level(2 * GIB, 16 * GIB), 2);
+        assert_eq!(memory_level(768 * 1_024 * 1_024, 16 * GIB), 3);
+    }
+
+    #[test]
+    fn large_memory_systems_keep_absolute_reserve() {
+        const GIB: u64 = 1_024 * 1_024 * 1_024;
+
+        assert_eq!(memory_level(5 * GIB, 64 * GIB), 1);
+        assert_eq!(memory_level(3 * GIB, 64 * GIB), 2);
+        assert_eq!(memory_level(768 * 1_024 * 1_024, 64 * GIB), 3);
+        assert_eq!(memory_level(0, 0), 0);
     }
 }

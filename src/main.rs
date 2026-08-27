@@ -3,8 +3,10 @@
 mod analysis;
 mod app;
 mod assets;
+mod audio;
 mod blind;
 mod chain;
+mod icon;
 mod theme;
 
 use app::Muspector;

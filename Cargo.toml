@@ -13,6 +13,18 @@ ebur128 = "0.1.10"
 gpui = { git = "https://github.com/zed-industries/zed", rev = "ac2f097559ecbaab6f55ca5a519f53b80ac54afb", default-features = false, features = ["font-kit"] }
 gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "ac2f097559ecbaab6f55ca5a519f53b80ac54afb", default-features = false, features = ["font-kit", "runtime_shaders", "wayland", "x11"] }
 realfft = "3.5"
+rodio = { version = "0.22.2", default-features = false, features = [
+    "playback",
+    "symphonia-aac",
+    "symphonia-alac",
+    "symphonia-flac",
+    "symphonia-isomp4",
+    "symphonia-mp3",
+    "symphonia-ogg",
+    "symphonia-pcm",
+    "symphonia-vorbis",
+    "symphonia-wav",
+] }
 rubato = "4.0.0"
 symphonia = { version = "0.5.5", default-features = false, features = [
     "aac",
