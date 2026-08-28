@@ -1,8 +1,9 @@
 # Muspector
 
 Muspector is a compact GPUI audio inspector for studying guitar tones. The
-current MVP performs local analysis, uses GFX Classifier to identify a likely
-drive/fuzz unit and its controls, and proposes an editable hybrid effect chain.
+current research build performs local analysis, uses the routed clean-reference
+Inspector candidate to detect Drive, Delay, and Reverb, and
+proposes an editable hybrid effect chain.
 The landscape workspace combines an RX-style analysis canvas with an
 Ableton-inspired horizontal device chain. A lightweight local transport previews
 the original audio without applying the proposed chain.
@@ -31,6 +32,19 @@ To launch the macOS app bundle with the Muspector Dock icon:
 
 ```sh
 ./tools/app /path/to/audio.mp3
+```
+
+Playback uses `rodio 0.22` over `cpal 0.17`: CoreAudio on macOS, WASAPI on a
+normal Windows build, and the available ALSA/JACK host on Linux. The Settings
+button beside the Wave button lists concrete output devices and persists the
+selection; choosing System Default follows the operating-system route.
+
+ASIO is intentionally opt-in because its Windows build requires the Steinberg
+ASIO SDK and LLVM/libclang. Set `CPAL_ASIO_DIR` when needed and build on Windows
+with:
+
+```sh
+cargo build --release --features asio
 ```
 
 `cargo dev` is a project-local alias for `cargo run`, defined in
@@ -82,8 +96,11 @@ For a manual UI check, run `cargo dev` and verify that:
    workspace size when the display has enough room.
 3. The RX-style analysis workspace and editable Signal Chain remain visible
    together without tabs or page transitions.
-4. Dropping another file works from the loaded workspace and replaces the
-   previous analysis only after the new inspection succeeds.
+4. Dropping or opening another file creates a pending tab and analyzes it in the
+   background. Switching to another ready or pending tab does not cancel the
+   job, and completion does not steal focus from the current workspace. Loading
+   progress follows real decode, loudness, spectrum, chain inference, and blind
+   model stages rather than an indeterminate timer.
 5. Opening an unsupported or invalid file shows a temporary toast without
    replacing the current workspace or locking its controls.
 6. Moving across the Workspace shows the corresponding time, peak, and RMS
@@ -98,6 +115,10 @@ For a manual UI check, run `cargo dev` and verify that:
 8. The Workspace Play button and Space pause or resume the original audio. A
    click fixes the pink playhead at that time; dragging creates a selection, and
    the adjacent Loop button repeats that selected range.
+   Right-clicking inside a selection opens Copy, Paste, Delete, Quick Export
+   WAV, and Select All. Command/Control + C, V, E, and A provide the matching
+   shortcuts; Backspace/Delete removes the selection. Audio edits are performed
+   against a lossless temporary working file and do not overwrite the source.
 9. The bottom Signal Chain is horizontally scrollable. Dragging anywhere on a
    device, including its expanded details, moves the complete card, leaves a
    muted placeholder, and reorders the surrounding devices as they make room.
@@ -119,10 +140,26 @@ For a manual UI check, run `cargo dev` and verify that:
 14. The upper-right CPU and RAM pressure strips update without interrupting the
     editor; inactive segments are gray and active pressure progresses through
     green, amber, and red.
-15. The right-side History menu lists document-local chain changes. Clicking an
-    entry jumps to that state; Command/Control + Z undoes and
-    Command/Control + Shift + Z redoes. Consecutive knob adjustments and one
-    card drag are each grouped into a single history step.
+15. The right-side History menu lists document-local signal-chain and audio
+    edits. Clicking an entry restores its working audio, waveform, selection,
+    playhead, and chain state; Command/Control + Z undoes and Command/Control +
+    Shift + Z redoes. Consecutive knob adjustments and one card drag are each
+    grouped into a single history step.
+16. The Wave button at the upper right opens Inspector Training. Import Clean
+    Audio builds and activates a new non-aligned clean reference; Import
+    Training File replaces it with a portable `.musp-training` bundle; Export
+    Current Training writes the active bundle. Re-scan open audio after changing
+    the active training.
+17. The adjacent Settings button opens the output-device menu. Switching output
+    releases the current stream and applies the selected CoreAudio, WASAPI, or
+    opt-in ASIO device on the next playback.
+18. Closing a modified tab asks whether to Save, Don’t Save, or Cancel. Closing
+    the application does the same for every modified tab and Save All completes
+    before the window exits. Command/Control + S saves the active document.
+    Saving writes a readable `<name>.muspector.json` project beside the source;
+    when audio was edited, it also writes `<name>.muspector.wav` without
+    overwriting the imported file. Temporary working audio and the playback
+    stream are released during a normal exit.
 
 ## Analysis
 
@@ -134,28 +171,61 @@ For a manual UI check, run `cargo dev` and verify that:
 - a 64-band logarithmic spectrum with low/mid/high energy, spectral centroid,
   and 85% rolloff markers
 - bounded envelope correlation for delay and diffuse-tail evidence
-- GFX blind classification for 13 drive/fuzz units and model-estimated Level,
-  Gain/Drive/Distortion, and Tone/Filter controls
-- heuristic Gate, Comp, EQ, Delay, and Reverb candidates with editable controls
+- routed Inspector classification for Drive, Delay, and Reverb, with the detected
+  confidence and evidence shown directly on the existing editable devices
+- heuristic Gate, Comp, and EQ candidates plus editable controls for the
+  model-classified effects
 
 Decoding runs on GPUI's background executor. Spectral analysis is streaming and
 keeps only a 4096-sample FFT window plus accumulated bins in memory. Profile
 analysis uses bounded streaming buckets and retains at most 32,768 analysis
 points, compacted to the available pixel width while rendering.
-The blind pass selects up to five high-energy two-second windows, converts them
-to the model's original 22.05 kHz / 128-band power-Mel input, and averages their
-predictions. Python is not required at runtime.
+The model pass resamples to 44.1 kHz and evaluates overlapping five-second
+windows using the training-compatible 2048-point FFT, 1024-sample hop, and 128
+normalized log-Mel bins. The routed non-aligned Clean-reference model uses the
+public-effects branch for Drive/Delay and the public-RIR branch for Reverb. Python is not
+required at runtime.
 
-GFX was trained on isolated wet guitar and only covers overdrive, distortion,
-and fuzz. A result from a full mix or a different effect family is out of
-distribution. It does not recover a complete chain or its order, so the UI
-labels the current result as GFX blind plus heuristic analysis. Paired
-render-and-compare analysis is planned around StemFX after the blind workflow.
+The Wave menu makes the reference replaceable. A Clean import uses at most the
+first ten seconds to compute separate Drive/Delay and Reverb frozen-encoder profiles and
+routed clean-derived thresholds. It performs zero gradient updates, requires no
+wet-labelled user recordings, and does not require aligned playing. A
+`.musp-training` schema-4 bundle stores only the 1,036 profile statistics, thresholds,
+and a name; the active bundle is restored from the platform application-support
+directory on the next launch. Older bundles must be recreated from their Clean
+audio because their single-profile contract is incompatible with the routed model.
+
+The checked-in default profile targets the development guitar/rig represented
+by `models/inspector/routed-device-profile.bin`; its routing was selected on the same
+development set, so it is not an unbiased unseen-device claim. It does not
+recover effect order or clean audio. Remixer remains a separate future model
+boundary.
+
+Reverb uses an additional compact temporal verifier after the clean-relative
+pair head. The final decision is an AND gate: the pair score must pass the
+profile-derived Reverb threshold and the verifier score must pass `0.342`.
+The verifier is fixed at runtime; importing Clean Audio does not fine-tune it.
+On the 15-file hardware development fixture the integrated Rust path is `15/15`
+exact and removes all four former Reverb false positives. That fixture was used
+during verifier fitting, so this is development regression evidence only; the
+release gate still requires an untouched device-disjoint labelled hardware set.
 
 ## Models and licenses
 
-- GFX Classifier code and model weights: BSD-3-Clause. The converted weights,
-  attribution, and upstream links are in `models/gfx`.
+- The Muspector source code is Apache-2.0. Model weights are separate artifacts
+  and are not relicensed under the repository's Apache license. The public-RIR Reverb
+  artifacts remain CC BY 4.0; the public-effects Drive/Delay artifacts are integrated as a
+  local non-commercial research candidate pending a redistribution decision.
+- The routed model uses the CC BY 4.0 DAFx25 chain, Aachen chapel RIR, EGFxSet,
+  Guitar-TECHS, and GuitarSet sources plus CC0 GuitarJam. The Drive/Delay branch also
+  uses in-memory renders produced by the GPL-3.0 Spotify Pedalboard training
+  tool, which is not bundled or linked into the application. IDMT, RemFX,
+  pretrained research weights, and Apple AU renders are excluded.
+- A `.musp-training` schema-4 file contains the user's derived reference statistics
+  and thresholds, not shared encoder/head weights or audio. Its use still
+  depends on the user's rights to the imported recording.
+- Hashes, attribution, artifact boundaries, and upstream links are in
+  `models/inspector/LICENSES.md`, `train/LICENSES.md`, and `NOTICE`.
 - `tract-onnx`: MIT or Apache-2.0; runs the checked-in ONNX models in Rust.
 - `rubato`: MIT or Apache-2.0; performs fixed-ratio high-quality resampling.
 - `ebur128`: MIT; performs EBU R128 / ITU-R BS.1770 loudness analysis.
@@ -166,14 +236,26 @@ render-and-compare analysis is planned around StemFX after the blind workflow.
 - `sysinfo`: MIT; samples only system CPU and memory data for the header pressure
   strips, with its default multithreading disabled.
 
-`tools/gfx.py` reproduces the ONNX conversion from the official PyTorch files.
-Its Python packages are conversion-only dependencies.
+`train/reference.py`, `train/detect.py`, and `train/relative.py` reproduce the
+semantic encoder/pair runs and ONNX exports; `train/route_relative_reports.py`
+records label routing. `train/reverb_verifier.py` trains the candidate-conditioned
+temporal Reverb verifier. The hardware-replay verifier is connected in the
+local non-commercial research runtime, while its release gate remains failed
+until an untouched device-disjoint hardware test passes.
+Training dependencies are not required by the application. These notices
+document provenance; they do not grant rights beyond the upstream licenses.
+CC BY 4.0 attribution requirements still apply when redistributing the
+Inspector artifacts.
 
 ## Layout
 
 - `app`: GPUI state and interface
 - `analysis`: decoding and signal metrics
-- `blind`: GFX preprocessing, inference, and pedal control mapping
+- `audio`: rodio/CPAL playback, device discovery, and persisted output routing
+- `clip`: streaming selection copy, delete, paste, and float-WAV export
+- `project`: durable effect-chain metadata and edited-audio save coordination
+- `blind`: routed Inspector preprocessing, dual-pair inference, and chain
+  classification
 - `chain`: effect inference and parameter models
 - `models`: attributed inference weights
 - `assets`: embedded interface icons

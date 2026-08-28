@@ -6,7 +6,9 @@ mod assets;
 mod audio;
 mod blind;
 mod chain;
+mod clip;
 mod icon;
+mod project;
 mod theme;
 
 use app::Muspector;
@@ -23,7 +25,15 @@ fn main() {
                 app_id: Some("dev.shiftz.muspector".to_owned()),
                 ..Default::default()
             },
-            |_window, cx| cx.new(Muspector::new),
+            |window, cx| {
+                let view = cx.new(Muspector::new);
+                let weak = view.downgrade();
+                window.on_window_should_close(cx, move |window, cx| {
+                    weak.update(cx, |this, cx| this.window_should_close(window, cx))
+                        .unwrap_or(true)
+                });
+                view
+            },
         )
         .expect("failed to open Muspector window");
         cx.activate(true);

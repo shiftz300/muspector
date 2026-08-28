@@ -1,10 +1,12 @@
 use crate::{
     analysis::{self, Report},
-    audio::Audio,
+    audio::{self, Audio},
+    blind,
     chain::{Chain, Effect, Param},
     icon::Icon,
     theme,
 };
+use anyhow::Context as AnyhowContext;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use gpui::PinchEvent;
 use gpui::{
@@ -13,8 +15,9 @@ use gpui::{
     FocusHandle, GlobalElementId, Hitbox, HitboxBehavior, InspectorElementId, IntoElement,
     KeyDownEvent, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathBuilder,
     PathPromptOptions, Pixels, Point, Position, PromptLevel, Render, ScrollHandle,
-    ScrollWheelEvent, Style, Styled, Transformation, Window, canvas, div, ease_in_out, point,
-    prelude::*, px, quad, radians, relative, size, svg, transparent_black,
+    ScrollWheelEvent, Style, Styled, Transformation, Window, canvas, div, ease_in_out,
+    linear_color_stop, linear_gradient, point, prelude::*, px, quad, radians, relative, size, svg,
+    transparent_black,
 };
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
@@ -24,6 +27,7 @@ use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 
 const TINT: Duration = Duration::from_millis(140);
 const CARD: Duration = Duration::from_millis(180);
+const TAB: Duration = Duration::from_millis(170);
 const HOLD: Duration = Duration::from_millis(2800);
 const REST: Duration = Duration::from_millis(760);
 const OPEN: usize = 0;
@@ -36,6 +40,34 @@ enum Fade {
     Idle,
     Out,
     In,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ToastKind {
+    Success,
+    Info,
+    Warning,
+    Error,
+}
+
+impl ToastKind {
+    fn color(self) -> gpui::Rgba {
+        match self {
+            Self::Success => theme::GOOD,
+            Self::Info => theme::ACCENT,
+            Self::Warning => theme::WARN,
+            Self::Error => theme::ERROR,
+        }
+    }
+
+    fn icon(self) -> Icon {
+        match self {
+            Self::Success => Icon::Check,
+            Self::Info => Icon::Info,
+            Self::Warning => Icon::TriangleAlert,
+            Self::Error => Icon::CircleX,
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -61,6 +93,7 @@ enum State {
 
 struct Alert {
     text: String,
+    kind: ToastKind,
     fade: Fade,
 }
 
@@ -247,12 +280,36 @@ impl Element for InspectorScrollbar {
     }
 }
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone)]
+struct Revision {
+    report: Box<Report>,
+    source: PathBuf,
+    audio_dirty: bool,
+}
+
+#[derive(Clone)]
 struct Snapshot {
     chain: Chain,
+    revision: Rc<Revision>,
     baseline: Chain,
     dirty: bool,
     expanded: [bool; 6],
+    selection: Option<(f32, f32)>,
+    playhead: Option<f32>,
+    looped: bool,
+}
+
+impl PartialEq for Snapshot {
+    fn eq(&self, other: &Self) -> bool {
+        self.chain == other.chain
+            && Rc::ptr_eq(&self.revision, &other.revision)
+            && self.baseline == other.baseline
+            && self.dirty == other.dirty
+            && self.expanded == other.expanded
+            && self.selection == other.selection
+            && self.playhead == other.playhead
+            && self.looped == other.looped
+    }
 }
 
 #[derive(Clone)]
@@ -269,16 +326,11 @@ struct History {
 }
 
 impl History {
-    fn detected(chain: Chain, baseline: Chain, expanded: [bool; 6]) -> Self {
+    fn detected(snapshot: Snapshot) -> Self {
         Self {
             entries: vec![Step {
                 label: "Detected".to_owned(),
-                snapshot: Snapshot {
-                    chain,
-                    baseline,
-                    dirty: false,
-                    expanded,
-                },
+                snapshot,
             }],
             cursor: 0,
             merge: None,
@@ -314,6 +366,14 @@ impl History {
     }
 }
 
+fn history_sources(history: &History) -> Vec<PathBuf> {
+    history
+        .entries
+        .iter()
+        .map(|step| step.snapshot.revision.source.clone())
+        .collect()
+}
+
 struct Control {
     default: Option<f32>,
     edit: Option<String>,
@@ -338,16 +398,62 @@ struct EffectDrag {
 #[derive(Clone)]
 struct Tab {
     path: PathBuf,
+    source: PathBuf,
+    project: Option<PathBuf>,
     report: Box<Report>,
     baseline: Chain,
     dirty: bool,
+    audio_dirty: bool,
+    revision: Rc<Revision>,
+    expanded: [bool; 6],
     history: History,
+    motion: usize,
+    shift: f32,
+}
+
+#[derive(Clone)]
+struct Pending {
+    id: u64,
+    path: PathBuf,
+    progress: f32,
+    previous: f32,
+    stage: &'static str,
+    motion: usize,
+}
+
+#[derive(Clone, Copy)]
+struct SelectionMenu {
+    position: Point<Pixels>,
+}
+
+#[derive(Clone, Copy)]
+enum AudioEdit {
+    Delete,
+    Paste,
+}
+
+#[derive(Clone)]
+struct SaveData {
+    path: PathBuf,
+    source: PathBuf,
+    project: Option<PathBuf>,
+    audio_dirty: bool,
+    chain: Chain,
+}
+
+#[derive(Clone)]
+struct Closing {
+    path: PathBuf,
+    token: usize,
 }
 
 #[derive(Clone)]
 struct TabDrag {
     path: PathBuf,
     name: String,
+    meta: String,
+    active: bool,
+    dirty: bool,
     position: Point<Pixels>,
 }
 
@@ -361,25 +467,82 @@ impl TabDrag {
 impl Render for TabDrag {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         div()
-            .pl(self.position.x - px(70.0))
-            .pt(self.position.y - px(18.0))
+            .pl(self.position.x - px(80.0))
+            .pt(self.position.y - px(22.0))
             .child(
                 div()
-                    .w(px(140.0))
-                    .h(px(36.0))
-                    .px_3()
-                    .rounded(theme::RADIUS)
-                    .border_1()
-                    .border_color(theme::ACCENT_SOFT)
-                    .bg(theme::SURFACE)
+                    .w(px(160.0))
+                    .h(px(44.0))
+                    .px_2()
+                    .border_b_2()
+                    .border_color(if self.active {
+                        theme::ACCENT
+                    } else {
+                        theme::LINE
+                    })
+                    .bg(if self.active {
+                        theme::SURFACE
+                    } else {
+                        theme::CANVAS
+                    })
                     .shadow_md()
                     .overflow_hidden()
-                    .whitespace_nowrap()
-                    .text_sm()
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
                     .flex()
                     .items_center()
-                    .child(self.name.clone()),
+                    .gap_2()
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .overflow_hidden()
+                            .flex()
+                            .flex_col()
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_xs()
+                                    .line_height(px(12.0))
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(3.0))
+                                    .children(self.dirty.then(|| {
+                                        div().flex_none().text_color(theme::ACCENT).child("*")
+                                    }))
+                                    .child(
+                                        div()
+                                            .min_w_0()
+                                            .overflow_hidden()
+                                            .text_color(if self.active {
+                                                theme::INK
+                                            } else {
+                                                theme::MUTED
+                                            })
+                                            .child(self.name.clone()),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .mt(px(2.0))
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_size(px(9.0))
+                                    .line_height(px(10.0))
+                                    .text_color(theme::FAINT)
+                                    .child(self.meta.clone()),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .size(px(20.0))
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(Icon::Close.draw(px(12.0), theme::MUTED)),
+                    ),
             )
     }
 }
@@ -523,10 +686,17 @@ impl Render for EffectDrag {
 pub struct Muspector {
     state: State,
     tabs: Vec<Tab>,
+    pending: Vec<Pending>,
     active: Option<usize>,
+    pending_active: Option<u64>,
     dirty: bool,
+    audio_dirty: bool,
     tab_dragging: Option<usize>,
+    tab_motion: usize,
+    tab_close: usize,
+    closing: Vec<Closing>,
     job: u64,
+    inspect_job: u64,
     hovers: [Hover; 1],
     glows: [usize; 1],
     alert: Option<Alert>,
@@ -534,6 +704,10 @@ pub struct Muspector {
     cursor: Option<f32>,
     playhead: Option<f32>,
     audio: Option<Audio>,
+    source: Option<PathBuf>,
+    revision: Option<Rc<Revision>>,
+    clipboard: Option<crate::clip::Clip>,
+    selection_menu: Option<SelectionMenu>,
     looped: bool,
     playback: usize,
     selection: Option<(f32, f32)>,
@@ -564,18 +738,36 @@ pub struct Muspector {
     rail_notice: usize,
     pressure: Pressure,
     history_track: ScrollHandle,
+    tab_track: ScrollHandle,
     tracks: [ScrollHandle; 3],
+    training: blind::Training,
+    training_open: bool,
+    training_motion: usize,
+    outputs: Vec<audio::Output>,
+    output: Option<String>,
+    settings_open: bool,
+    settings_motion: usize,
+    closing_app: bool,
 }
 
 impl Muspector {
     pub fn new(cx: &mut Context<Self>) -> Self {
+        let outputs = audio::outputs();
+        let output = audio::load_output();
         let mut this = Self {
             state: State::Empty,
             tabs: Vec::new(),
+            pending: Vec::new(),
             active: None,
+            pending_active: None,
             dirty: false,
+            audio_dirty: false,
             tab_dragging: None,
+            tab_motion: 0,
+            tab_close: 0,
+            closing: Vec::new(),
             job: 0,
+            inspect_job: 0,
             hovers: [Hover::Idle; 1],
             glows: [0; 1],
             alert: None,
@@ -583,6 +775,10 @@ impl Muspector {
             cursor: None,
             playhead: None,
             audio: None,
+            source: None,
+            revision: None,
+            clipboard: None,
+            selection_menu: None,
             looped: false,
             playback: 0,
             selection: None,
@@ -613,11 +809,20 @@ impl Muspector {
             rail_notice: 0,
             pressure: Pressure::default(),
             history_track: ScrollHandle::new(),
+            tab_track: ScrollHandle::new(),
             tracks: [
                 ScrollHandle::new(),
                 ScrollHandle::new(),
                 ScrollHandle::new(),
             ],
+            training: blind::Training::load_active(),
+            training_open: false,
+            training_motion: 0,
+            outputs,
+            output,
+            settings_open: false,
+            settings_motion: 0,
+            closing_app: false,
         };
         if let Some(path) = std::env::args_os().nth(1) {
             this.start(PathBuf::from(path), cx);
@@ -661,11 +866,12 @@ impl Muspector {
         .detach();
     }
 
-    fn warn(&mut self, text: String, cx: &mut Context<Self>) {
+    fn notify(&mut self, kind: ToastKind, text: String, cx: &mut Context<Self>) {
         self.notice = self.notice.wrapping_add(1);
         let notice = self.notice;
         self.alert = Some(Alert {
             text,
+            kind,
             fade: Fade::In,
         });
         cx.notify();
@@ -714,6 +920,22 @@ impl Muspector {
             });
         })
         .detach();
+    }
+
+    fn success(&mut self, text: String, cx: &mut Context<Self>) {
+        self.notify(ToastKind::Success, text, cx);
+    }
+
+    fn info(&mut self, text: String, cx: &mut Context<Self>) {
+        self.notify(ToastKind::Info, text, cx);
+    }
+
+    fn warn(&mut self, text: String, cx: &mut Context<Self>) {
+        self.notify(ToastKind::Warning, text, cx);
+    }
+
+    fn error(&mut self, text: String, cx: &mut Context<Self>) {
+        self.notify(ToastKind::Error, text, cx);
     }
 
     fn hover(&mut self, slot: usize, hovered: bool, cx: &mut Context<Self>) {
@@ -814,6 +1036,170 @@ impl Muspector {
         .detach();
     }
 
+    fn import_clean(&mut self, cx: &mut Context<Self>) {
+        self.set_training_open(false, cx);
+        let receiver = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Import Clean".into()),
+        });
+        cx.spawn(async move |view, cx| {
+            if let Ok(Ok(Some(paths))) = receiver.await
+                && let Some(path) = paths.into_iter().next()
+            {
+                let task = cx.background_spawn(async move { analysis::training_from_clean(&path) });
+                let result = task.await;
+                let _ = view.update(cx, |this, cx| match result {
+                    Ok(training) => {
+                        let name = training.name().to_owned();
+                        match training.save_active() {
+                            Ok(()) => {
+                                this.training = training;
+                                this.success(
+                                    format!(
+                                        "Clean reference “{name}” is active · rescan open audio"
+                                    ),
+                                    cx,
+                                );
+                            }
+                            Err(error) => {
+                                this.error(format!("Could not save training: {error:#}"), cx)
+                            }
+                        }
+                    }
+                    Err(error) => this.error(format!("Could not import clean: {error:#}"), cx),
+                });
+            }
+        })
+        .detach();
+    }
+
+    fn import_training(&mut self, cx: &mut Context<Self>) {
+        self.set_training_open(false, cx);
+        let receiver = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Import Training".into()),
+        });
+        cx.spawn(async move |view, cx| {
+            if let Ok(Ok(Some(paths))) = receiver.await
+                && let Some(path) = paths.into_iter().next()
+            {
+                let task = cx.background_spawn(async move {
+                    let bytes = std::fs::read(&path)
+                        .map_err(anyhow::Error::from)
+                        .with_context(|| format!("could not read {}", path.display()))?;
+                    blind::Training::import(&bytes)
+                });
+                let result = task.await;
+                let _ = view.update(cx, |this, cx| match result {
+                    Ok(training) => {
+                        let name = training.name().to_owned();
+                        match training.save_active() {
+                            Ok(()) => {
+                                this.training = training;
+                                this.success(
+                                    format!("Training “{name}” is active · rescan open audio"),
+                                    cx,
+                                );
+                            }
+                            Err(error) => {
+                                this.error(format!("Could not save training: {error:#}"), cx)
+                            }
+                        }
+                    }
+                    Err(error) => this.error(format!("Could not import training: {error:#}"), cx),
+                });
+            }
+        })
+        .detach();
+    }
+
+    fn export_training(&mut self, cx: &mut Context<Self>) {
+        self.set_training_open(false, cx);
+        let receiver =
+            cx.prompt_for_new_path(Path::new("."), Some("muspector-profile.musp-training"));
+        let bytes = self.training.export();
+        cx.spawn(async move |view, cx| {
+            if let Ok(Ok(Some(path))) = receiver.await {
+                let shown = path.clone();
+                let result = cx
+                    .background_spawn(async move { std::fs::write(path, bytes) })
+                    .await;
+                let _ = view.update(cx, |this, cx| match result {
+                    Ok(()) => this.success(format!("Training exported to {}", shown.display()), cx),
+                    Err(error) => this.error(format!("Could not export training: {error}"), cx),
+                });
+            }
+        })
+        .detach();
+    }
+
+    fn set_training_open(&mut self, open: bool, cx: &mut Context<Self>) {
+        if self.training_open == open {
+            return;
+        }
+        self.training_open = open;
+        if open {
+            self.settings_open = false;
+        }
+        self.training_motion = self.training_motion.wrapping_add(1).max(1);
+        let motion = self.training_motion;
+        cx.notify();
+        cx.spawn(async move |view, cx| {
+            cx.background_executor().timer(TINT).await;
+            let _ = view.update(cx, |this, cx| {
+                if this.training_motion == motion {
+                    this.training_motion = 0;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn set_settings_open(&mut self, open: bool, cx: &mut Context<Self>) {
+        if self.settings_open == open {
+            return;
+        }
+        if open {
+            self.outputs = audio::outputs();
+            self.training_open = false;
+        }
+        self.settings_open = open;
+        self.settings_motion = self.settings_motion.wrapping_add(1).max(1);
+        let motion = self.settings_motion;
+        cx.notify();
+        cx.spawn(async move |view, cx| {
+            cx.background_executor().timer(TINT).await;
+            let _ = view.update(cx, |this, cx| {
+                if this.settings_motion == motion {
+                    this.settings_motion = 0;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn select_output(&mut self, output: Option<String>, cx: &mut Context<Self>) {
+        if self.output == output {
+            self.set_settings_open(false, cx);
+            return;
+        }
+        if let Err(error) = audio::save_output(output.as_deref()) {
+            self.error(format!("Could not save audio output: {error:#}"), cx);
+            return;
+        }
+        self.output = output;
+        self.audio = None;
+        self.playback = self.playback.wrapping_add(1);
+        self.set_settings_open(false, cx);
+        self.success("Audio output updated".to_owned(), cx);
+    }
+
     fn reset_editor(&mut self) {
         self.playback = self.playback.wrapping_add(1);
         self.audio = None;
@@ -823,6 +1209,7 @@ impl Muspector {
         self.selection = None;
         self.drag = None;
         self.pan = None;
+        self.selection_menu = None;
         self.zoom = 1.0;
         self.view = 0.0;
         self.scale = 1.0;
@@ -850,9 +1237,9 @@ impl Muspector {
     fn seek(&mut self, position: f32, cx: &mut Context<Self>) {
         let position = position.clamp(0.0, 1.0);
         self.playhead = Some(position);
-        let Some((path, duration)) = (match &self.state {
-            State::Ready(report) => Some((report.path.clone(), report.duration)),
-            State::Empty | State::Loading(_) => None,
+        let Some((path, duration)) = (match (&self.state, &self.source) {
+            (State::Ready(report), Some(source)) => Some((source.clone(), report.duration)),
+            _ => None,
         }) else {
             return;
         };
@@ -863,16 +1250,16 @@ impl Muspector {
         });
         if let Some(Err(error)) = result {
             self.audio = None;
-            self.warn(format!("Could not seek: {error}"), cx);
+            self.error(format!("Could not seek: {error}"), cx);
         } else {
             cx.notify();
         }
     }
 
     fn toggle_play(&mut self, cx: &mut Context<Self>) {
-        let Some((path, duration)) = (match &self.state {
-            State::Ready(report) => Some((report.path.clone(), report.duration)),
-            State::Empty | State::Loading(_) => None,
+        let Some((path, duration)) = (match (&self.state, &self.source) {
+            (State::Ready(report), Some(source)) => Some((source.clone(), report.duration)),
+            _ => None,
         }) else {
             return;
         };
@@ -906,10 +1293,11 @@ impl Muspector {
             match Audio::open(
                 &path,
                 Duration::from_secs_f64(duration * f64::from(position)),
+                self.output.as_deref(),
             ) {
                 Ok(audio) => self.audio = Some(audio),
                 Err(error) => {
-                    self.warn(format!("Could not play: {error}"), cx);
+                    self.error(format!("Could not play: {error}"), cx);
                     return;
                 }
             }
@@ -962,7 +1350,9 @@ impl Muspector {
                             return false;
                         };
                         let duration = report.duration;
-                        let path = report.path.clone();
+                        let Some(path) = this.source.clone() else {
+                            return false;
+                        };
                         let Some(audio) = &this.audio else {
                             return false;
                         };
@@ -1015,10 +1405,18 @@ impl Muspector {
             return;
         };
         tab.report = report.clone();
+        if let Some(source) = &self.source {
+            tab.source = source.clone();
+        }
+        if let Some(revision) = &self.revision {
+            tab.revision = revision.clone();
+        }
         if let Some(baseline) = &self.baseline {
             tab.baseline = baseline.clone();
         }
         tab.dirty = self.dirty;
+        tab.audio_dirty = self.audio_dirty;
+        tab.expanded = self.expanded;
         tab.history = self.history.clone();
     }
 
@@ -1031,20 +1429,59 @@ impl Muspector {
         self.sync_active();
         let tab = self.tabs[index].clone();
         self.active = Some(index);
+        self.pending_active = None;
         self.state = State::Ready(tab.report);
+        self.source = Some(tab.source);
+        self.revision = Some(tab.revision);
         self.baseline = Some(tab.baseline);
         self.dirty = tab.dirty;
+        self.audio_dirty = tab.audio_dirty;
         self.history = tab.history;
         self.reset_editor();
-        if let Some(snapshot) = self.history.current() {
-            self.expanded = snapshot.expanded;
-        } else if let State::Ready(report) = &self.state
-            && let Some(index) = report.chain.effects.iter().position(|effect| effect.active)
-            && index < self.expanded.len()
-        {
-            self.expanded[index] = true;
-        }
+        self.expanded = tab.expanded;
         cx.notify();
+    }
+
+    fn activate_pending(&mut self, id: u64, cx: &mut Context<Self>) {
+        let Some(path) = self
+            .pending
+            .iter()
+            .find(|pending| pending.id == id)
+            .map(|pending| pending.path.clone())
+        else {
+            return;
+        };
+        self.sync_active();
+        self.active = None;
+        self.pending_active = Some(id);
+        self.audio = None;
+        self.playback = self.playback.wrapping_add(1);
+        self.reset_editor();
+        self.state = State::Loading(path);
+        cx.notify();
+    }
+
+    fn close_pending(&mut self, id: u64, cx: &mut Context<Self>) {
+        let Some(index) = self.pending.iter().position(|pending| pending.id == id) else {
+            return;
+        };
+        self.pending.remove(index);
+        if self.pending_active != Some(id) {
+            cx.notify();
+            return;
+        }
+        self.pending_active = None;
+        if self.tabs.is_empty() {
+            if let Some(next) = self.pending.first().cloned() {
+                self.pending_active = Some(next.id);
+                self.state = State::Loading(next.path);
+            } else {
+                self.state = State::Empty;
+            }
+            cx.notify();
+        } else {
+            self.activate(0, cx);
+        }
     }
 
     fn mark_dirty(&mut self) {
@@ -1062,21 +1499,63 @@ impl Muspector {
         };
         Some(Snapshot {
             chain: report.chain.clone(),
+            revision: self.revision.clone()?,
             baseline: self.baseline.clone()?,
             dirty: self.dirty,
             expanded: self.expanded,
+            selection: self.selection,
+            playhead: self.playhead,
+            looped: self.looped,
         })
+    }
+
+    fn refresh_history_cursor(&mut self) {
+        let Some(snapshot) = self.snapshot() else {
+            return;
+        };
+        if let Some(step) = self.history.entries.get_mut(self.history.cursor) {
+            step.snapshot = snapshot;
+        }
+        if let Some(index) = self.active
+            && let Some(tab) = self.tabs.get_mut(index)
+        {
+            tab.history = self.history.clone();
+        }
     }
 
     fn record(&mut self, label: impl Into<String>, merge: bool) {
         let Some(snapshot) = self.snapshot() else {
             return;
         };
+        let previous = history_sources(&self.history);
         self.history.record(label.into(), snapshot, merge);
         if let Some(index) = self.active
             && let Some(tab) = self.tabs.get_mut(index)
         {
+            tab.expanded = self.expanded;
             tab.history = self.history.clone();
+        }
+        self.cleanup_unreferenced(previous);
+    }
+
+    fn cleanup_unreferenced(&self, sources: Vec<PathBuf>) {
+        for source in sources {
+            let retained = self.source.as_ref() == Some(&source)
+                || self
+                    .clipboard
+                    .as_ref()
+                    .is_some_and(|clip| clip.path == source)
+                || self.tabs.iter().any(|tab| {
+                    tab.source == source
+                        || tab
+                            .history
+                            .entries
+                            .iter()
+                            .any(|step| step.snapshot.revision.source == source)
+                });
+            if !retained {
+                crate::clip::cleanup(&source);
+            }
         }
     }
 
@@ -1086,14 +1565,20 @@ impl Muspector {
         };
         self.history.cursor = cursor;
         self.history.merge = None;
-        if let State::Ready(report) = &mut self.state {
-            report.chain = step.snapshot.chain.clone();
-        } else {
-            return;
-        }
+        self.audio = None;
+        self.playback = self.playback.wrapping_add(1);
+        let mut report = step.snapshot.revision.report.clone();
+        report.chain = step.snapshot.chain.clone();
+        self.state = State::Ready(report.clone());
+        self.source = Some(step.snapshot.revision.source.clone());
+        self.revision = Some(step.snapshot.revision.clone());
         self.baseline = Some(step.snapshot.baseline.clone());
+        self.audio_dirty = step.snapshot.revision.audio_dirty;
         self.dirty = step.snapshot.dirty;
         self.expanded = step.snapshot.expanded;
+        self.selection = step.snapshot.selection;
+        self.playhead = step.snapshot.playhead;
+        self.looped = step.snapshot.looped && self.selection.is_some();
         self.edit = None;
         self.cards = [0; 6];
         self.folds = [0; 6];
@@ -1103,9 +1588,13 @@ impl Muspector {
         if let Some(index) = self.active
             && let Some(tab) = self.tabs.get_mut(index)
         {
-            tab.report.chain = step.snapshot.chain;
+            tab.report = report;
+            tab.source = step.snapshot.revision.source.clone();
+            tab.revision = step.snapshot.revision;
             tab.baseline = step.snapshot.baseline;
-            tab.dirty = step.snapshot.dirty;
+            tab.dirty = self.dirty;
+            tab.audio_dirty = self.audio_dirty;
+            tab.expanded = self.expanded;
             tab.history = self.history.clone();
         }
         cx.notify();
@@ -1127,20 +1616,40 @@ impl Muspector {
         self.restore(cursor, cx);
     }
 
-    fn close_now(&mut self, index: usize, cx: &mut Context<Self>) {
+    fn remove_tab(&mut self, path: &Path, cx: &mut Context<Self>) {
+        let Some(index) = self.tabs.iter().position(|tab| tab.path == path) else {
+            return;
+        };
         if index >= self.tabs.len() {
             return;
         }
         let was_active = self.active == Some(index);
-        self.tabs.remove(index);
+        let removed = self.tabs.remove(index);
+        if was_active {
+            self.audio = None;
+        }
+        crate::clip::cleanup(&removed.source);
+        for step in &removed.history.entries {
+            crate::clip::cleanup(&step.snapshot.revision.source);
+        }
+        self.closing.retain(|closing| closing.path != path);
         self.tab_dragging = None;
         if self.tabs.is_empty() {
             self.active = None;
-            self.state = State::Empty;
+            self.source = None;
+            self.revision = None;
             self.baseline = None;
             self.dirty = false;
+            self.audio_dirty = false;
             self.history = History::default();
             self.reset_editor();
+            if let Some(pending) = self.pending.first() {
+                self.pending_active = Some(pending.id);
+                self.state = State::Loading(pending.path.clone());
+            } else {
+                self.pending_active = None;
+                self.state = State::Empty;
+            }
         } else if was_active {
             self.active = None;
             self.activate(index.min(self.tabs.len() - 1), cx);
@@ -1151,6 +1660,36 @@ impl Muspector {
             self.active = Some(active - 1);
         }
         cx.notify();
+    }
+
+    fn close_now(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(path) = self.tabs.get(index).map(|tab| tab.path.clone()) else {
+            return;
+        };
+        if self.closing.iter().any(|closing| closing.path == path) {
+            return;
+        }
+        self.tab_close = self.tab_close.wrapping_add(1).max(1);
+        let token = self.tab_close;
+        self.closing.push(Closing {
+            path: path.clone(),
+            token,
+        });
+        cx.notify();
+
+        cx.spawn(async move |view, cx| {
+            cx.background_executor().timer(TAB).await;
+            let _ = view.update(cx, move |this, cx| {
+                let still_closing = this
+                    .closing
+                    .iter()
+                    .any(|closing| closing.path == path && closing.token == token);
+                if still_closing {
+                    this.remove_tab(&path, cx);
+                }
+            });
+        })
+        .detach();
     }
 
     fn close(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -1166,30 +1705,281 @@ impl Muspector {
         let name = self.tabs[index].report.name();
         let answer = window.prompt(
             PromptLevel::Warning,
-            &format!("Discard changes to {name}?"),
-            Some("The adjusted effect chain has not been saved."),
-            &["Discard", "Cancel"],
+            &format!("Save changes to {name}?"),
+            Some("This document has unsaved audio or signal-chain changes."),
+            &["Save", "Don’t Save", "Cancel"],
             cx,
         );
-        cx.spawn(async move |view, cx| {
-            if answer.await.unwrap_or(1) != 0 {
-                return;
+        cx.spawn(async move |view, cx| match answer.await.unwrap_or(2) {
+            0 => {
+                let _ = view.update(cx, |this, cx| this.save_and_close(path, cx));
             }
-            let _ = view.update(cx, |this, cx| {
-                if let Some(index) = this.tabs.iter().position(|tab| tab.path == path) {
-                    this.close_now(index, cx);
+            1 => {
+                let _ = view.update(cx, |this, cx| {
+                    if let Some(index) = this.tabs.iter().position(|tab| tab.path == path) {
+                        this.close_now(index, cx);
+                    }
+                });
+            }
+            _ => {}
+        })
+        .detach();
+    }
+
+    fn save_data(&self, path: &Path) -> Option<SaveData> {
+        let tab = self.tabs.iter().find(|tab| tab.path == path)?;
+        Some(SaveData {
+            path: tab.path.clone(),
+            source: tab.source.clone(),
+            project: tab.project.clone(),
+            audio_dirty: tab.audio_dirty,
+            chain: tab.report.chain.clone(),
+        })
+    }
+
+    fn apply_saved(&mut self, path: &Path, saved: crate::project::Saved) {
+        let Some(index) = self.tabs.iter().position(|tab| tab.path == path) else {
+            return;
+        };
+        let old_source = self.tabs[index].source.clone();
+        let revision = Rc::new(Revision {
+            report: self.tabs[index].report.clone(),
+            source: saved.audio.clone(),
+            audio_dirty: false,
+        });
+        self.tabs[index].project = Some(saved.project);
+        self.tabs[index].source = saved.audio.clone();
+        self.tabs[index].dirty = false;
+        self.tabs[index].audio_dirty = false;
+        self.tabs[index].revision = revision.clone();
+        let cursor = self.tabs[index].history.cursor;
+        if let Some(step) = self.tabs[index].history.entries.get_mut(cursor) {
+            step.snapshot.revision = revision.clone();
+            step.snapshot.dirty = false;
+        }
+        if self.active == Some(index) {
+            self.audio = None;
+            self.source = Some(saved.audio);
+            self.revision = Some(revision);
+            self.dirty = false;
+            self.audio_dirty = false;
+            self.history = self.tabs[index].history.clone();
+        }
+        let retained = self.tabs.iter().any(|tab| {
+            tab.source == old_source
+                || tab
+                    .history
+                    .entries
+                    .iter()
+                    .any(|step| step.snapshot.revision.source == old_source)
+        });
+        if !retained {
+            crate::clip::cleanup(&old_source);
+        }
+    }
+
+    fn cleanup(&mut self) {
+        self.audio = None;
+        for tab in &self.tabs {
+            crate::clip::cleanup(&tab.source);
+            for step in &tab.history.entries {
+                crate::clip::cleanup(&step.snapshot.revision.source);
+            }
+        }
+        if let Some(clipboard) = self.clipboard.take() {
+            crate::clip::cleanup(&clipboard.path);
+        }
+    }
+
+    fn save_and_close(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        self.sync_active();
+        let Some(data) = self.save_data(&path) else {
+            return;
+        };
+        let task = cx.background_spawn(async move {
+            crate::project::save(
+                data.project.as_deref(),
+                &data.path,
+                &data.source,
+                data.audio_dirty,
+                &data.chain,
+            )
+        });
+        cx.spawn(async move |view, cx| {
+            let result = task.await;
+            let _ = view.update(cx, |this, cx| match result {
+                Ok(saved) => {
+                    let shown = saved.project.clone();
+                    this.apply_saved(&path, saved);
+                    this.success(format!("Saved {}", shown.display()), cx);
+                    if let Some(index) = this.tabs.iter().position(|tab| tab.path == path) {
+                        this.close_now(index, cx);
+                    }
                 }
+                Err(error) => this.error(format!("Could not save: {error:#}"), cx),
             });
         })
         .detach();
     }
 
-    fn reorder_tab(&mut self, from: usize, to: usize, cx: &mut Context<Self>) {
+    fn save_active(&mut self, cx: &mut Context<Self>) {
+        self.sync_active();
+        let Some(path) = self
+            .active
+            .and_then(|index| self.tabs.get(index))
+            .map(|tab| tab.path.clone())
+        else {
+            return;
+        };
+        let Some(data) = self.save_data(&path) else {
+            return;
+        };
+        let task = cx.background_spawn(async move {
+            crate::project::save(
+                data.project.as_deref(),
+                &data.path,
+                &data.source,
+                data.audio_dirty,
+                &data.chain,
+            )
+        });
+        cx.spawn(async move |view, cx| {
+            let result = task.await;
+            let _ = view.update(cx, |this, cx| match result {
+                Ok(saved) => {
+                    let shown = saved.project.clone();
+                    this.apply_saved(&path, saved);
+                    this.success(format!("Saved {}", shown.display()), cx);
+                }
+                Err(error) => this.error(format!("Could not save: {error:#}"), cx),
+            });
+        })
+        .detach();
+    }
+
+    pub fn window_should_close(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        self.sync_active();
+        if !self.tabs.iter().any(|tab| tab.dirty) {
+            self.cleanup();
+            return true;
+        }
+        if !self.closing_app {
+            self.ask_quit(window, cx);
+        }
+        false
+    }
+
+    fn ask_quit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.closing_app = true;
+        let dirty = self.tabs.iter().filter(|tab| tab.dirty).count();
+        let detail = if dirty == 1 {
+            "One document has unsaved changes.".to_owned()
+        } else {
+            format!("{dirty} documents have unsaved changes.")
+        };
+        let handle = window.window_handle();
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            "Save changes before quitting?",
+            Some(&detail),
+            &["Save All", "Don’t Save", "Cancel"],
+            cx,
+        );
+        cx.spawn(async move |view, cx| match answer.await.unwrap_or(2) {
+            0 => {
+                let Ok(data) = view.update(cx, |this, _cx| {
+                    this.sync_active();
+                    this.tabs
+                        .iter()
+                        .filter(|tab| tab.dirty)
+                        .map(|tab| SaveData {
+                            path: tab.path.clone(),
+                            source: tab.source.clone(),
+                            project: tab.project.clone(),
+                            audio_dirty: tab.audio_dirty,
+                            chain: tab.report.chain.clone(),
+                        })
+                        .collect::<Vec<_>>()
+                }) else {
+                    return;
+                };
+                let task = cx.background_spawn(async move {
+                    let mut saved = Vec::with_capacity(data.len());
+                    for item in data {
+                        let result = crate::project::save(
+                            item.project.as_deref(),
+                            &item.path,
+                            &item.source,
+                            item.audio_dirty,
+                            &item.chain,
+                        )?;
+                        saved.push((item.path, result));
+                    }
+                    Ok::<_, anyhow::Error>(saved)
+                });
+                let result = task.await;
+                let close = view
+                    .update(cx, |this, cx| match result {
+                        Ok(saved) => {
+                            for (path, saved) in saved {
+                                this.apply_saved(&path, saved);
+                            }
+                            this.cleanup();
+                            true
+                        }
+                        Err(error) => {
+                            this.closing_app = false;
+                            this.error(format!("Could not save: {error:#}"), cx);
+                            false
+                        }
+                    })
+                    .unwrap_or(false);
+                if close {
+                    let _ = handle.update(cx, |_root, window, _cx| window.remove_window());
+                }
+            }
+            1 => {
+                let _ = view.update(cx, |this, _cx| this.cleanup());
+                let _ = handle.update(cx, |_root, window, _cx| window.remove_window());
+            }
+            _ => {
+                let _ = view.update(cx, |this, cx| {
+                    this.closing_app = false;
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    fn reorder_tab(&mut self, from: usize, to: usize, distance: f32, cx: &mut Context<Self>) {
         if from == to || from >= self.tabs.len() || to >= self.tabs.len() {
             return;
         }
+        if self.closing.iter().any(|closing| {
+            closing.path == self.tabs[from].path || closing.path == self.tabs[to].path
+        }) {
+            return;
+        }
+        self.tab_motion = self.tab_motion.wrapping_add(1).max(1);
+        let motion = self.tab_motion;
+        for tab in &mut self.tabs {
+            tab.motion = 0;
+            tab.shift = 0.0;
+        }
         let tab = self.tabs.remove(from);
         self.tabs.insert(to, tab);
+        if from < to {
+            for tab in &mut self.tabs[from..to] {
+                tab.motion = motion;
+                tab.shift = distance;
+            }
+        } else {
+            for tab in &mut self.tabs[(to + 1)..=from] {
+                tab.motion = motion;
+                tab.shift = -distance;
+            }
+        }
         if let Some(active) = self.active {
             self.active = Some(if active == from {
                 to
@@ -1203,6 +1993,26 @@ impl Muspector {
         }
         self.tab_dragging = Some(to);
         cx.notify();
+
+        cx.spawn(async move |view, cx| {
+            cx.background_executor().timer(TAB).await;
+            let _ = view.update(cx, move |this, cx| {
+                if this.tab_motion == motion {
+                    for tab in &mut this.tabs {
+                        tab.motion = 0;
+                        tab.shift = 0.0;
+                    }
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn finish_tab_drag(&mut self, cx: &mut Context<Self>) {
+        if self.tab_dragging.take().is_some() {
+            cx.notify();
+        }
     }
 
     fn start(&mut self, path: PathBuf, cx: &mut Context<Self>) {
@@ -1214,76 +2024,153 @@ impl Muspector {
 
         if let Some(index) = self.tabs.iter().position(|tab| tab.path == path) {
             self.activate(index, cx);
-            self.warn("This file is already open".to_owned(), cx);
+            self.info("This file is already open".to_owned(), cx);
             return;
         }
-        if matches!(&self.state, State::Loading(loading) if loading == &path) {
-            self.warn("This file is already being inspected".to_owned(), cx);
+        if let Some(id) = self
+            .pending
+            .iter()
+            .find(|pending| pending.path == path)
+            .map(|pending| pending.id)
+        {
+            self.activate_pending(id, cx);
+            self.info("This file is already being inspected".to_owned(), cx);
             return;
         }
 
         self.sync_active();
-        let previous = match &self.state {
-            State::Ready(report) => Some(report.clone()),
-            State::Empty | State::Loading(_) => self
-                .active
-                .and_then(|index| self.tabs.get(index))
-                .map(|tab| tab.report.clone()),
-        };
-        if self.alert.take().is_some() {
-            self.notice = self.notice.wrapping_add(1);
+        self.inspect_job = self.inspect_job.wrapping_add(1).max(1);
+        let job = self.inspect_job;
+        self.pending.push(Pending {
+            id: job,
+            path: path.clone(),
+            progress: 0.0,
+            previous: 0.0,
+            stage: "Queued",
+            motion: 0,
+        });
+        let foreground = self.active.is_none() && self.pending_active.is_none();
+        if foreground {
+            self.pending_active = Some(job);
+            self.state = State::Loading(path.clone());
+            self.reset_editor();
+            self.fit = false;
         }
-        self.job = self.job.wrapping_add(1);
-        self.reset_editor();
-        self.fit = false;
-        let job = self.job;
-        self.state = State::Loading(path.clone());
         cx.notify();
 
-        let task = cx.background_spawn(async move { analysis::inspect(&path) });
+        let training = self.training.clone();
+        let (progress_tx, progress_rx) = std::sync::mpsc::channel();
+        let task = cx.background_spawn(async move {
+            analysis::inspect_with_progress(&path, training, |progress| {
+                let _ = progress_tx.send(progress);
+            })
+        });
+        cx.spawn(async move |view, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(33))
+                    .await;
+                let mut latest = None;
+                let mut disconnected = false;
+                loop {
+                    match progress_rx.try_recv() {
+                        Ok(progress) => latest = Some(progress),
+                        Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                            disconnected = true;
+                            break;
+                        }
+                    }
+                }
+                let pending = view
+                    .update(cx, |this, cx| {
+                        let Some(pending) =
+                            this.pending.iter_mut().find(|pending| pending.id == job)
+                        else {
+                            return false;
+                        };
+                        if let Some(progress) = latest {
+                            pending.previous = pending.progress;
+                            pending.progress = progress.value.clamp(0.0, 1.0);
+                            pending.stage = progress.stage;
+                            pending.motion = pending.motion.wrapping_add(1).max(1);
+                            cx.notify();
+                        }
+                        true
+                    })
+                    .unwrap_or(false);
+                if !pending || disconnected {
+                    break;
+                }
+            }
+        })
+        .detach();
         cx.spawn(async move |view, cx| {
             let result = task.await;
             let _ = view.update(cx, |this, cx| {
-                if this.job != job {
+                let Some(pending) = this.pending.iter().position(|pending| pending.id == job)
+                else {
                     return;
-                }
+                };
+                let foreground = this.pending_active == Some(job);
+                this.pending.remove(pending);
                 match result {
                     Ok(report) => {
-                        let expanded = report
-                            .chain
-                            .effects
-                            .iter()
-                            .position(|effect| effect.active)
-                            .unwrap_or(0);
                         let report = Box::new(report);
                         let baseline = report.chain.clone();
-                        let mut expanded_state = [false; 6];
-                        if expanded < expanded_state.len() {
-                            expanded_state[expanded] = true;
-                        }
-                        let history = History::detected(
-                            report.chain.clone(),
-                            baseline.clone(),
-                            expanded_state,
-                        );
+                        let expanded_state = [false; 6];
+                        let revision = Rc::new(Revision {
+                            report: report.clone(),
+                            source: report.path.clone(),
+                            audio_dirty: false,
+                        });
+                        let history = History::detected(Snapshot {
+                            chain: report.chain.clone(),
+                            revision: revision.clone(),
+                            baseline: baseline.clone(),
+                            dirty: false,
+                            expanded: expanded_state,
+                            selection: None,
+                            playhead: None,
+                            looped: false,
+                        });
                         this.tabs.push(Tab {
                             path: report.path.clone(),
+                            source: report.path.clone(),
+                            project: None,
                             report: report.clone(),
                             baseline: baseline.clone(),
                             dirty: false,
+                            audio_dirty: false,
+                            revision: revision.clone(),
+                            expanded: expanded_state,
                             history: history.clone(),
+                            motion: 0,
+                            shift: 0.0,
                         });
-                        this.active = Some(this.tabs.len() - 1);
-                        this.dirty = false;
-                        this.baseline = Some(baseline);
-                        this.history = history;
-                        this.state = State::Ready(report);
-                        this.expanded = expanded_state;
-                        cx.notify();
+                        if foreground {
+                            this.pending_active = None;
+                            this.fit = false;
+                            this.activate(this.tabs.len() - 1, cx);
+                        } else {
+                            cx.notify();
+                        }
                     }
                     Err(error) => {
-                        this.state = previous.map(State::Ready).unwrap_or(State::Empty);
-                        this.warn(format!("{error:#}"), cx);
+                        if foreground {
+                            this.pending_active = None;
+                            if this.tabs.is_empty() {
+                                if let Some(next) = this.pending.first().cloned() {
+                                    this.pending_active = Some(next.id);
+                                    this.state = State::Loading(next.path);
+                                } else {
+                                    this.state = State::Empty;
+                                }
+                            } else {
+                                this.activate(0, cx);
+                            }
+                        }
+                        this.error(format!("{error:#}"), cx);
                     }
                 }
             });
@@ -1386,6 +2273,7 @@ impl Muspector {
 
     fn reset(&mut self, cx: &mut Context<Self>) {
         if let (State::Ready(report), Some(baseline)) = (&mut self.state, &self.baseline) {
+            let audio_dirty = self.audio_dirty;
             report.chain = baseline.clone();
             self.edit = None;
             self.cards = [0; 6];
@@ -1394,16 +2282,12 @@ impl Muspector {
             self.moves = [0; 6];
             self.shifts = [0.0; 6];
             self.dragging = None;
-            self.dirty = false;
+            self.dirty = audio_dirty;
             if let Some(index) = self.active
                 && let Some(tab) = self.tabs.get_mut(index)
             {
-                tab.dirty = false;
-            }
-            if let Some(index) = report.chain.effects.iter().position(|effect| effect.active)
-                && index < self.expanded.len()
-            {
-                self.expanded[index] = true;
+                tab.dirty = audio_dirty;
+                tab.expanded = self.expanded;
             }
             self.record("Reset chain", false);
             cx.notify();
@@ -1490,12 +2374,16 @@ impl Muspector {
         };
         self.sync_active();
         let previous = self.tabs[index].clone();
+        let source = previous.source.clone();
         let from = previous.report.duration * f64::from(selection.0);
         let to = previous.report.duration * f64::from(selection.1);
         self.job = self.job.wrapping_add(1);
         let job = self.job;
 
-        let task = cx.background_spawn(async move { analysis::inspect_range(&path, from, to) });
+        let training = self.training.clone();
+        let task = cx.background_spawn(async move {
+            analysis::inspect_range_with_training(&source, from, to, training)
+        });
         cx.spawn(async move |view, cx| {
             let result = task.await;
             let _ = view.update(cx, |this, cx| {
@@ -1510,23 +2398,22 @@ impl Muspector {
                         let chain = scanned.chain;
                         let baseline = chain.clone();
                         let active = this.active == Some(index);
-                        let mut expanded = [false; 6];
-                        if let Some(effect) = chain.effects.iter().position(|effect| effect.active)
-                            && effect < expanded.len()
-                        {
-                            expanded[effect] = true;
-                        }
+                        let expanded = [false; 6];
 
                         this.tabs[index].report.chain = chain.clone();
                         this.tabs[index].baseline = baseline.clone();
-                        this.tabs[index].dirty = false;
+                        let audio_dirty = previous.audio_dirty;
+                        this.tabs[index].dirty = audio_dirty;
+                        this.tabs[index].audio_dirty = audio_dirty;
+                        this.tabs[index].expanded = expanded;
 
                         if active {
                             if let State::Ready(report) = &mut this.state {
                                 report.chain = chain.clone();
                             }
                             this.baseline = Some(baseline.clone());
-                            this.dirty = false;
+                            this.dirty = audio_dirty;
+                            this.audio_dirty = audio_dirty;
                             this.edit = None;
                             this.cards = [0; 6];
                             this.folds = [0; 6];
@@ -1537,22 +2424,28 @@ impl Muspector {
                             this.selection = Some(selection);
                             this.record("Rescan selection", false);
                         } else {
+                            let previous = history_sources(&this.tabs[index].history);
                             let snapshot = Snapshot {
                                 chain,
+                                revision: this.tabs[index].revision.clone(),
                                 baseline,
-                                dirty: false,
+                                dirty: audio_dirty,
                                 expanded,
+                                selection: None,
+                                playhead: None,
+                                looped: false,
                             };
                             this.tabs[index].history.record(
                                 "Rescan selection".to_owned(),
                                 snapshot,
                                 false,
                             );
+                            this.cleanup_unreferenced(previous);
                         }
                         cx.notify();
                     }
                     Err(error) => {
-                        this.warn(format!("{error:#}"), cx);
+                        this.error(format!("{error:#}"), cx);
                     }
                 }
             });
@@ -1560,11 +2453,232 @@ impl Muspector {
         .detach();
     }
 
+    fn selected_range(&self) -> Option<(PathBuf, PathBuf, f64, f64)> {
+        let index = self.active?;
+        let tab = self.tabs.get(index)?;
+        let (start, end) = self.selection.map(|range| ordered(range.0, range.1))?;
+        let bins = tab.report.profile.points.len().saturating_sub(1).max(1);
+        if end - start <= 0.5 / bins as f32 {
+            return None;
+        }
+        Some((
+            tab.path.clone(),
+            tab.source.clone(),
+            tab.report.duration * f64::from(start),
+            tab.report.duration * f64::from(end),
+        ))
+    }
+
+    fn copy_selection(&mut self, cx: &mut Context<Self>) {
+        let Some((_logical, source, start, end)) = self.selected_range() else {
+            self.warn("Select a non-empty audio range".to_owned(), cx);
+            return;
+        };
+        self.selection_menu = None;
+        let task = cx.background_spawn(async move { crate::clip::copy(&source, start, end) });
+        cx.spawn(async move |view, cx| {
+            let result = task.await;
+            let _ = view.update(cx, |this, cx| match result {
+                Ok(clip) => {
+                    let duration = clip.duration();
+                    this.clipboard = Some(clip);
+                    this.success(format!("Copied {}", span(duration)), cx);
+                }
+                Err(error) => this.error(format!("Could not copy audio: {error:#}"), cx),
+            });
+        })
+        .detach();
+    }
+
+    fn edit_audio(&mut self, edit: AudioEdit, cx: &mut Context<Self>) {
+        let Some(index) = self.active else {
+            return;
+        };
+        let Some(tab) = self.tabs.get(index).cloned() else {
+            return;
+        };
+        let logical = tab.path.clone();
+        let source = tab.source.clone();
+        let duration = tab.report.duration;
+        let chain = tab.report.chain.clone();
+        let baseline = tab.baseline.clone();
+        let (start, end) = match edit {
+            AudioEdit::Delete => {
+                let Some((_logical, _source, start, end)) = self.selected_range() else {
+                    self.warn("Select a non-empty audio range".to_owned(), cx);
+                    return;
+                };
+                (start, end)
+            }
+            AudioEdit::Paste => {
+                let position = self
+                    .selection
+                    .map(|range| ordered(range.0, range.1))
+                    .unwrap_or_else(|| {
+                        let position = self.playhead.or(self.cursor).unwrap_or(0.0);
+                        (position, position)
+                    });
+                (
+                    duration * f64::from(position.0),
+                    duration * f64::from(position.1),
+                )
+            }
+        };
+        let clip = match edit {
+            AudioEdit::Paste => {
+                let Some(clip) = self.clipboard.clone() else {
+                    self.warn("Copy an audio range before pasting".to_owned(), cx);
+                    return;
+                };
+                Some(clip)
+            }
+            AudioEdit::Delete => None,
+        };
+        self.refresh_history_cursor();
+        self.selection_menu = None;
+        self.audio = None;
+        self.playback = self.playback.wrapping_add(1);
+        self.job = self.job.wrapping_add(1);
+        let job = self.job;
+        let training = self.training.clone();
+        let task = cx.background_spawn(async move {
+            let edited = match edit {
+                AudioEdit::Delete => crate::clip::delete(&source, start, end),
+                AudioEdit::Paste => crate::clip::paste(
+                    &source,
+                    clip.as_ref().expect("paste clipboard checked"),
+                    start,
+                    end,
+                ),
+            }?;
+            let mut report = analysis::inspect_with_training(&edited.path, training)?;
+            report.path = logical.clone();
+            report.chain = chain;
+            Ok::<_, anyhow::Error>((logical, edited.path, Box::new(report)))
+        });
+        cx.spawn(async move |view, cx| {
+            let result = task.await;
+            let _ = view.update(cx, |this, cx| {
+                if this.job != job {
+                    if let Ok((_, source, _)) = &result {
+                        crate::clip::cleanup(source);
+                    }
+                    return;
+                }
+                match result {
+                    Ok((logical, source, report)) => {
+                        let Some(index) = this.tabs.iter().position(|tab| tab.path == logical)
+                        else {
+                            crate::clip::cleanup(&source);
+                            return;
+                        };
+                        let active = this.active == Some(index);
+                        let revision = Rc::new(Revision {
+                            report: report.clone(),
+                            source: source.clone(),
+                            audio_dirty: true,
+                        });
+                        this.tabs[index].source = source.clone();
+                        this.tabs[index].report = report.clone();
+                        this.tabs[index].baseline = baseline.clone();
+                        this.tabs[index].dirty = true;
+                        this.tabs[index].audio_dirty = true;
+                        this.tabs[index].revision = revision.clone();
+                        if active {
+                            this.source = Some(source);
+                            this.state = State::Ready(report);
+                            this.revision = Some(revision);
+                            this.baseline = Some(baseline);
+                            this.dirty = true;
+                            this.audio_dirty = true;
+                            this.selection = None;
+                            this.looped = false;
+                            this.playhead = Some((start / duration.max(f64::EPSILON)) as f32);
+                            this.record(
+                                match edit {
+                                    AudioEdit::Delete => "Delete selection",
+                                    AudioEdit::Paste => "Paste audio",
+                                },
+                                false,
+                            );
+                        } else {
+                            let previous = history_sources(&this.tabs[index].history);
+                            let snapshot = Snapshot {
+                                chain: this.tabs[index].report.chain.clone(),
+                                revision,
+                                baseline,
+                                dirty: true,
+                                expanded: this.tabs[index].expanded,
+                                selection: None,
+                                playhead: Some((start / duration.max(f64::EPSILON)) as f32),
+                                looped: false,
+                            };
+                            this.tabs[index].history.record(
+                                match edit {
+                                    AudioEdit::Delete => "Delete selection",
+                                    AudioEdit::Paste => "Paste audio",
+                                }
+                                .to_owned(),
+                                snapshot,
+                                false,
+                            );
+                            this.cleanup_unreferenced(previous);
+                        }
+                        this.success(
+                            match edit {
+                                AudioEdit::Delete => "Selection deleted",
+                                AudioEdit::Paste => "Audio pasted",
+                            }
+                            .to_owned(),
+                            cx,
+                        );
+                    }
+                    Err(error) => this.error(format!("Could not edit audio: {error:#}"), cx),
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn quick_export(&mut self, cx: &mut Context<Self>) {
+        let Some((logical, source, start, end)) = self.selected_range() else {
+            self.warn("Select a non-empty audio range".to_owned(), cx);
+            return;
+        };
+        let target = selection_path(&logical);
+        self.selection_menu = None;
+        let shown = target.clone();
+        let task =
+            cx.background_spawn(async move { crate::clip::export(&source, &target, start, end) });
+        cx.spawn(async move |view, cx| {
+            let result = task.await;
+            let _ = view.update(cx, |this, cx| match result {
+                Ok(()) => this.success(format!("Exported {}", shown.display()), cx),
+                Err(error) => this.error(format!("Could not export WAV: {error:#}"), cx),
+            });
+        })
+        .detach();
+    }
+
+    fn select_all(&mut self, cx: &mut Context<Self>) {
+        if matches!(self.state, State::Ready(_)) {
+            self.selection = Some((0.0, 1.0));
+            self.cursor = Some(1.0);
+            self.selection_menu = None;
+            cx.notify();
+        }
+    }
+
     fn expand(&mut self, effect: usize, cx: &mut Context<Self>) {
         if effect >= self.expanded.len() {
             return;
         }
         self.expanded[effect] = !self.expanded[effect];
+        if let Some(index) = self.active
+            && let Some(tab) = self.tabs.get_mut(index)
+        {
+            tab.expanded = self.expanded;
+        }
         self.folds[effect] = self.folds[effect].wrapping_add(1).max(1);
         let fold = self.folds[effect];
         cx.notify();
@@ -1714,6 +2828,11 @@ impl Muspector {
             }
             if command {
                 match event.keystroke.key.as_str() {
+                    "a" => self.select_all(cx),
+                    "c" => self.copy_selection(cx),
+                    "v" => self.edit_audio(AudioEdit::Paste, cx),
+                    "e" => self.quick_export(cx),
+                    "s" => self.save_active(cx),
                     "=" | "+" => self.scale(1.25, 0.5, cx),
                     "-" => self.scale(0.8, 0.5, cx),
                     "0" => {
@@ -1726,6 +2845,14 @@ impl Muspector {
                         return;
                     }
                 }
+                cx.stop_propagation();
+                return;
+            }
+            if matches!(
+                event.keystroke.key.as_str(),
+                "backspace" | "delete" | "forwarddelete"
+            ) {
+                self.edit_audio(AudioEdit::Delete, cx);
                 cx.stop_propagation();
                 return;
             }
@@ -1800,6 +2927,7 @@ impl Muspector {
 
     fn toast(&self) -> Option<AnyElement> {
         let alert = self.alert.as_ref()?;
+        let color = alert.kind.color();
         let node = div()
             .absolute()
             .top(px(76.0))
@@ -1814,8 +2942,8 @@ impl Muspector {
                     .py_3()
                     .rounded(theme::RADIUS)
                     .border_1()
-                    .border_color(theme::ERROR)
-                    .bg(theme::PANEL)
+                    .border_color(theme::mix(theme::LINE, color, 0.62))
+                    .bg(theme::mix(theme::PANEL, color, 0.07))
                     .text_sm()
                     .text_color(theme::INK)
                     .flex()
@@ -1823,9 +2951,14 @@ impl Muspector {
                     .gap_2()
                     .child(
                         div()
-                            .text_color(theme::ERROR)
-                            .font_weight(gpui::FontWeight::BOLD)
-                            .child("!"),
+                            .size(px(24.0))
+                            .flex_none()
+                            .rounded_full()
+                            .bg(theme::mix(theme::PANEL, color, 0.18))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(alert.kind.icon().draw(px(15.0), color)),
                     )
                     .child(alert.text.clone()),
             );
@@ -1881,11 +3014,38 @@ impl Muspector {
     }
 
     fn loading(&self, path: &Path) -> AnyElement {
+        let pending = self
+            .pending_active
+            .and_then(|id| self.pending.iter().find(|pending| pending.id == id))
+            .or_else(|| self.pending.iter().find(|pending| pending.path == path));
+        let progress = pending.map_or(0.0, |pending| pending.progress);
+        let previous = pending.map_or(progress, |pending| pending.previous);
+        let stage = pending.map_or("Preparing", |pending| pending.stage);
+        let motion = pending.map_or(0, |pending| pending.motion);
         let name = path
             .file_name()
             .and_then(|value| value.to_str())
             .unwrap_or("Audio")
             .to_owned();
+        let bar = div()
+            .w(relative(progress))
+            .h_full()
+            .rounded_full()
+            .bg(linear_gradient(
+                90.0,
+                linear_color_stop(theme::ACCENT_SOFT, 0.0),
+                linear_color_stop(theme::ACCENT, 1.0),
+            ));
+        let bar = if motion == 0 {
+            bar.into_any_element()
+        } else {
+            bar.with_animation(
+                ("inspect-progress", motion),
+                Animation::new(TINT).with_easing(ease_in_out),
+                move |bar, delta| bar.w(relative(previous + (progress - previous) * delta)),
+            )
+            .into_any_element()
+        };
         div()
             .flex_1()
             .w_full()
@@ -1900,16 +3060,15 @@ impl Muspector {
             .bg(theme::SURFACE)
             .child(
                 div()
-                    .size(px(48.0))
+                    .w(px(240.0))
+                    .h(px(6.0))
+                    .relative()
+                    .overflow_hidden()
                     .rounded_full()
-                    .border_2()
-                    .border_color(theme::ACCENT)
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .font_weight(gpui::FontWeight::BOLD)
-                    .text_color(theme::ACCENT)
-                    .child("···"),
+                    .bg(theme::TRACK)
+                    .border_1()
+                    .border_color(theme::LINE)
+                    .child(bar),
             )
             .child(
                 div()
@@ -1919,7 +3078,12 @@ impl Muspector {
                     .text_color(theme::INK)
                     .child("Inspecting"),
             )
-            .child(div().text_sm().text_color(theme::MUTED).child(name))
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(theme::MUTED)
+                    .child(format!("{name}  ·  {stage}  ·  {:.0}%", progress * 100.0)),
+            )
             .into_any_element()
     }
 
@@ -1981,20 +3145,44 @@ impl Muspector {
             .into_any_element()
     }
 
-    fn tab(&self, index: usize, tab: &Tab, cx: &mut Context<Self>) -> AnyElement {
-        let active = self.active == Some(index) && matches!(self.state, State::Ready(_));
-        let dirty = if active { self.dirty } else { tab.dirty };
-        let path = tab.path.clone();
-        let drag = TabDrag {
-            path: path.clone(),
-            name: tab.report.name(),
-            position: Point::default(),
+    fn pending_tab(&self, pending: &Pending, cx: &mut Context<Self>) -> AnyElement {
+        let id = pending.id;
+        let active = self.pending_active == Some(id);
+        let name = pending
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("Audio")
+            .to_owned();
+        let progress = pending.progress;
+        let previous = pending.previous;
+        let motion = pending.motion;
+        let bar = div()
+            .absolute()
+            .bottom_0()
+            .left_0()
+            .w(relative(progress))
+            .h(px(2.0))
+            .rounded_full()
+            .bg(theme::ACCENT);
+        let bar = if motion == 0 {
+            bar.into_any_element()
+        } else {
+            let token = (id as usize).wrapping_mul(10_000).wrapping_add(motion);
+            bar.with_animation(
+                ("pending-progress", token),
+                Animation::new(TINT).with_easing(ease_in_out),
+                move |bar, delta| bar.w(relative(previous + (progress - previous) * delta)),
+            )
+            .into_any_element()
         };
         div()
-            .id(("tab", index))
+            .id(("pending-tab", id as usize))
             .h_full()
             .min_w(px(116.0))
             .max_w(px(220.0))
+            .relative()
+            .overflow_hidden()
             .px_2()
             .border_b_2()
             .border_color(if active { theme::ACCENT } else { theme::LINE })
@@ -2006,52 +3194,16 @@ impl Muspector {
             .flex()
             .items_center()
             .gap_2()
-            .cursor_move()
+            .cursor_pointer()
             .hover(|node| node.bg(theme::HOVER))
             .on_click(cx.listener(move |this, _event, _window, cx| {
-                this.activate(index, cx);
-            }))
-            .on_drag(drag.clone(), |drag: &TabDrag, position, _window, cx| {
-                cx.new(|_| drag.clone().position(position))
-            })
-            .on_drag_move::<TabDrag>(cx.listener(
-                move |this, event: &DragMoveEvent<TabDrag>, _window, cx| {
-                    if !event.bounds.contains(&event.event.position) {
-                        return;
-                    }
-                    let Some(original) = this
-                        .tabs
-                        .iter()
-                        .position(|tab| tab.path == event.drag(cx).path)
-                    else {
-                        return;
-                    };
-                    let from = this.tab_dragging.unwrap_or(original);
-                    if this.tab_dragging.is_none() {
-                        this.tab_dragging = Some(from);
-                    }
-                    let midpoint = event.bounds.center().x;
-                    let crossed = (from < index && event.event.position.x > midpoint)
-                        || (from > index && event.event.position.x < midpoint);
-                    if crossed {
-                        this.reorder_tab(from, index, cx);
-                    }
-                },
-            ))
-            .on_drop(cx.listener(|this, _drag: &TabDrag, _window, cx| {
-                this.tab_dragging = None;
-                cx.notify();
+                this.activate_pending(id, cx);
             }))
             .child(
                 div()
-                    .id(("tab-content", index))
                     .min_w_0()
                     .flex_1()
                     .overflow_hidden()
-                    .cursor_move()
-                    .on_drag(drag, |drag: &TabDrag, position, _window, cx| {
-                        cx.new(|_| drag.clone().position(position))
-                    })
                     .flex()
                     .flex_col()
                     .child(
@@ -2062,56 +3214,227 @@ impl Muspector {
                             .line_height(px(12.0))
                             .font_weight(gpui::FontWeight::SEMIBOLD)
                             .text_color(if active { theme::INK } else { theme::MUTED })
-                            .child(tab.report.name()),
+                            .child(name),
                     )
                     .child(
                         div()
                             .mt(px(2.0))
-                            .overflow_hidden()
-                            .whitespace_nowrap()
                             .text_size(px(9.0))
                             .line_height(px(10.0))
                             .text_color(theme::FAINT)
-                            .child(format!(
-                                "{} · {}",
-                                tab.report.format_text(),
-                                tab.report.duration_text()
-                            )),
+                            .child(format!("{} · {:.0}%", pending.stage, progress * 100.0)),
                     ),
             )
-            .children(dirty.then(|| {
-                div()
-                    .size(px(5.0))
-                    .flex_none()
-                    .rounded_full()
-                    .bg(theme::ACCENT)
-            }))
             .child(
                 div()
-                    .id(("close-tab", index))
+                    .id(("close-pending", id as usize))
                     .size(px(20.0))
                     .flex_none()
                     .rounded(theme::RADIUS)
-                    .text_sm()
-                    .text_color(theme::MUTED)
                     .flex()
                     .items_center()
                     .justify_center()
                     .cursor_pointer()
-                    .hover(|node| node.bg(theme::TRACK).text_color(theme::INK))
+                    .hover(|node| node.bg(theme::TRACK))
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|_this, _event, _window, cx| cx.stop_propagation()),
                     )
-                    .on_click(cx.listener(move |this, _event, window, cx| {
+                    .on_click(cx.listener(move |this, _event, _window, cx| {
                         cx.stop_propagation();
-                        this.close(index, window, cx);
+                        this.close_pending(id, cx);
                     }))
-                    .child(
-                        Icon::Close
-                            .draw(px(12.0), theme::MUTED)
-                            .hover(|icon| icon.text_color(theme::INK)),
-                    ),
+                    .child(Icon::Close.draw(px(12.0), theme::MUTED)),
+            )
+            .child(bar)
+            .into_any_element()
+    }
+
+    fn tab(&self, index: usize, tab: &Tab, cx: &mut Context<Self>) -> AnyElement {
+        let active = self.active == Some(index) && matches!(self.state, State::Ready(_));
+        let dirty = if active { self.dirty } else { tab.dirty };
+        let closing = self
+            .closing
+            .iter()
+            .find(|closing| closing.path == tab.path)
+            .map(|closing| closing.token);
+        let dragging = self.tab_dragging == Some(index);
+        let path = tab.path.clone();
+        let drag = TabDrag {
+            path: path.clone(),
+            name: tab.report.name(),
+            meta: format!(
+                "{} · {}",
+                tab.report.format_text(),
+                tab.report.duration_text()
+            ),
+            active,
+            dirty,
+            position: Point::default(),
+        };
+        let node =
+            div()
+                .id(("tab", index))
+                .h_full()
+                .min_w(px(116.0))
+                .max_w(px(220.0))
+                .relative()
+                .overflow_hidden()
+                .opacity(if dragging { 0.62 } else { 1.0 })
+                .px_2()
+                .border_b_2()
+                .border_color(if active { theme::ACCENT } else { theme::LINE })
+                .bg(if active {
+                    theme::SURFACE
+                } else {
+                    theme::CANVAS
+                })
+                .flex()
+                .items_center()
+                .gap_2()
+                .cursor_move()
+                .hover(|node| node.bg(theme::HOVER))
+                .on_click(cx.listener(move |this, _event, _window, cx| {
+                    this.activate(index, cx);
+                }))
+                .on_drag(drag.clone(), |drag: &TabDrag, position, _window, cx| {
+                    cx.new(|_| drag.clone().position(position))
+                })
+                .on_drag_move::<TabDrag>(cx.listener(
+                    move |this, event: &DragMoveEvent<TabDrag>, _window, cx| {
+                        if !event.bounds.contains(&event.event.position) {
+                            return;
+                        }
+                        let Some(original) = this
+                            .tabs
+                            .iter()
+                            .position(|tab| tab.path == event.drag(cx).path)
+                        else {
+                            return;
+                        };
+                        let from = this.tab_dragging.unwrap_or(original);
+                        if this.tab_dragging.is_none() {
+                            this.tab_dragging = Some(from);
+                        }
+                        let midpoint = event.bounds.center().x;
+                        let crossed = (from < index && event.event.position.x > midpoint)
+                            || (from > index && event.event.position.x < midpoint);
+                        if crossed {
+                            this.reorder_tab(from, index, f32::from(event.bounds.size.width), cx);
+                        }
+                    },
+                ))
+                .on_drop(cx.listener(|this, _drag: &TabDrag, _window, cx| {
+                    this.finish_tab_drag(cx);
+                }))
+                .child(
+                    div()
+                        .id(("tab-content", index))
+                        .min_w_0()
+                        .flex_1()
+                        .overflow_hidden()
+                        .cursor_move()
+                        .on_drag(drag, |drag: &TabDrag, position, _window, cx| {
+                            cx.new(|_| drag.clone().position(position))
+                        })
+                        .flex()
+                        .flex_col()
+                        .child(
+                            div()
+                                .min_w_0()
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .text_xs()
+                                .line_height(px(12.0))
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .flex()
+                                .items_center()
+                                .gap(px(3.0))
+                                .children(dirty.then(|| {
+                                    div().flex_none().text_color(theme::ACCENT).child("*")
+                                }))
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .overflow_hidden()
+                                        .text_color(if active { theme::INK } else { theme::MUTED })
+                                        .child(tab.report.name()),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .mt(px(2.0))
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .text_size(px(9.0))
+                                .line_height(px(10.0))
+                                .text_color(theme::FAINT)
+                                .child(format!(
+                                    "{} · {}",
+                                    tab.report.format_text(),
+                                    tab.report.duration_text()
+                                )),
+                        ),
+                )
+                .child(
+                    div()
+                        .id(("close-tab", index))
+                        .size(px(20.0))
+                        .flex_none()
+                        .rounded(theme::RADIUS)
+                        .text_sm()
+                        .text_color(theme::MUTED)
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .cursor_pointer()
+                        .hover(|node| node.bg(theme::TRACK).text_color(theme::INK))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|_this, _event, _window, cx| cx.stop_propagation()),
+                        )
+                        .on_click(cx.listener(move |this, _event, window, cx| {
+                            cx.stop_propagation();
+                            this.close(index, window, cx);
+                        }))
+                        .child(
+                            Icon::Close
+                                .draw(px(12.0), theme::MUTED)
+                                .hover(|icon| icon.text_color(theme::INK)),
+                        ),
+                );
+        let node = if tab.motion == 0 {
+            node.into_any_element()
+        } else {
+            let shift = tab.shift;
+            let token = tab.motion.wrapping_mul(1_000).wrapping_add(index);
+            node.with_animation(
+                ("tab-move", token),
+                Animation::new(TAB).with_easing(ease_in_out),
+                move |node, delta| node.left(px(shift * (1.0 - delta))),
+            )
+            .into_any_element()
+        };
+        let Some(token) = closing else {
+            return node;
+        };
+        div()
+            .h_full()
+            .min_w(px(116.0))
+            .max_w(px(220.0))
+            .flex_none()
+            .overflow_hidden()
+            .child(node)
+            .with_animation(
+                ("tab-close", token),
+                Animation::new(TAB).with_easing(ease_in_out),
+                |shell, delta| {
+                    let remaining = 1.0 - delta;
+                    shell
+                        .min_w(px(116.0 * remaining))
+                        .max_w(px(220.0 * remaining))
+                        .opacity(remaining)
+                },
             )
             .into_any_element()
     }
@@ -2159,6 +3482,38 @@ impl Muspector {
                 )
                 .into_any_element(),
         };
+        let tab_max = f32::from(self.tab_track.max_offset().x).max(0.0);
+        let tab_offset = (-f32::from(self.tab_track.offset().x)).clamp(0.0, tab_max);
+        let hidden_right = tab_max > 0.5 && tab_offset + 0.5 < tab_max;
+        let tabs = div()
+            .id("tabs")
+            .min_w_0()
+            .flex_1()
+            .h_full()
+            .overflow_x_scroll()
+            .scrollbar_width(px(0.0))
+            .track_scroll(&self.tab_track)
+            .flex()
+            .items_center()
+            .on_scroll_wheel(cx.listener(|_this, _event, _window, cx| cx.notify()))
+            .on_drop(cx.listener(|this, _drag: &TabDrag, _window, cx| {
+                this.finish_tab_drag(cx);
+            }))
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, _event, _window, cx| this.finish_tab_drag(cx)),
+            )
+            .children(
+                self.tabs
+                    .iter()
+                    .enumerate()
+                    .map(|(index, tab)| self.tab(index, tab, cx)),
+            )
+            .children(
+                self.pending
+                    .iter()
+                    .map(|pending| self.pending_tab(pending, cx)),
+            );
 
         div()
             .w_full()
@@ -2195,66 +3550,397 @@ impl Muspector {
             .child(button)
             .child(
                 div()
-                    .id("tabs")
+                    .relative()
                     .min_w_0()
                     .flex_1()
                     .h_full()
-                    .overflow_x_scroll()
-                    .flex()
-                    .items_center()
-                    .on_mouse_up_out(
-                        MouseButton::Left,
-                        cx.listener(|this, _event, _window, cx| {
-                            if this.tab_dragging.take().is_some() {
-                                cx.notify();
-                            }
-                        }),
-                    )
-                    .children(
-                        self.tabs
-                            .iter()
-                            .enumerate()
-                            .map(|(index, tab)| self.tab(index, tab, cx)),
-                    )
-                    .children(match &self.state {
-                        State::Loading(path) => Some(
-                            div()
-                                .h_full()
-                                .min_w(px(116.0))
-                                .max_w(px(220.0))
-                                .px_3()
-                                .border_b_2()
-                                .border_color(theme::MUTED)
-                                .bg(theme::SURFACE)
-                                .overflow_hidden()
-                                .whitespace_nowrap()
-                                .text_sm()
-                                .text_color(theme::MUTED)
-                                .flex()
-                                .items_center()
-                                .child(
-                                    path.file_name()
-                                        .and_then(|name| name.to_str())
-                                        .unwrap_or("Inspecting…")
-                                        .to_owned(),
+                    .overflow_hidden()
+                    .child(tabs)
+                    .children(hidden_right.then(|| {
+                        div()
+                            .absolute()
+                            .top_0()
+                            .right_0()
+                            .w(px(30.0))
+                            .h_full()
+                            .bg(linear_gradient(
+                                90.0,
+                                linear_color_stop(theme::CANVAS, 1.0),
+                                linear_color_stop(
+                                    gpui::Rgba {
+                                        a: 0.0,
+                                        ..theme::CANVAS
+                                    },
+                                    0.0,
                                 ),
-                        ),
-                        State::Empty | State::Ready(_) => None,
-                    }),
+                            ))
+                    })),
             )
             .child(
                 div()
-                    .w(px(126.0))
-                    .min_w(px(126.0))
+                    .id("training")
+                    .size(px(26.0))
+                    .flex_none()
+                    .rounded(theme::RADIUS)
+                    .text_color(if self.training_open {
+                        theme::ACCENT
+                    } else {
+                        theme::MUTED
+                    })
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .hover(|node| node.bg(theme::HOVER).text_color(theme::INK))
+                    .on_click(cx.listener(|this, _event, _window, cx| {
+                        this.set_training_open(!this.training_open, cx);
+                    }))
+                    .child(Icon::Wave.draw(
+                        px(15.0),
+                        if self.training_open {
+                            theme::ACCENT
+                        } else {
+                            theme::MUTED
+                        },
+                    )),
+            )
+            .child(
+                div()
+                    .id("settings")
+                    .size(px(26.0))
+                    .flex_none()
+                    .rounded(theme::RADIUS)
+                    .text_color(if self.settings_open {
+                        theme::ACCENT
+                    } else {
+                        theme::MUTED
+                    })
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .hover(|node| node.bg(theme::HOVER).text_color(theme::INK))
+                    .on_click(cx.listener(|this, _event, _window, cx| {
+                        this.set_settings_open(!this.settings_open, cx);
+                    }))
+                    .child(Icon::Settings.draw(
+                        px(15.0),
+                        if self.settings_open {
+                            theme::ACCENT
+                        } else {
+                            theme::MUTED
+                        },
+                    )),
+            )
+            .child(
+                div()
                     .flex_none()
                     .flex()
                     .items_center()
-                    .justify_end()
                     .gap_3()
                     .child(pressure("CPU", self.pressure.cpu))
                     .child(pressure("RAM", self.pressure.ram)),
             )
             .into_any_element()
+    }
+
+    fn settings_menu(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        (self.settings_open || self.settings_motion != 0).then(|| {
+            let current = self
+                .output
+                .as_ref()
+                .and_then(|id| self.outputs.iter().find(|output| &output.id == id));
+            let summary = current
+                .map(|output| format!("{} · {}", output.backend, output.name))
+                .unwrap_or_else(|| "Operating system default".to_owned());
+
+            let default_selected = self.output.is_none();
+            let mut menu = div()
+                .id("settings-menu")
+                .absolute()
+                .top(px(38.0))
+                .right(px(112.0))
+                .w(px(300.0))
+                .max_h(px(430.0))
+                .rounded(theme::RADIUS)
+                .border_1()
+                .border_color(theme::LINE)
+                .bg(theme::PANEL)
+                .shadow_md()
+                .flex()
+                .flex_col()
+                .overflow_hidden()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|_this, _event, _window, cx| cx.stop_propagation()),
+                )
+                .child(
+                    div()
+                        .px_3()
+                        .py_3()
+                        .border_b_1()
+                        .border_color(theme::LINE)
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(
+                            div()
+                                .text_size(px(9.0))
+                                .text_color(theme::FAINT)
+                                .child("AUDIO OUTPUT"),
+                        )
+                        .child(
+                            div()
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .text_sm()
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .text_color(theme::INK)
+                                .child(summary),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(9.0))
+                                .text_color(theme::FAINT)
+                                .child("Playback uses rodio and CPAL"),
+                        ),
+                )
+                .child(output_row(
+                    "system-output",
+                    "System Default".to_owned(),
+                    "Follow the operating system output".to_owned(),
+                    default_selected,
+                    cx.listener(|this, _event, _window, cx| {
+                        this.select_output(None, cx);
+                    }),
+                ));
+
+            let list = div()
+                .id("audio-output-list")
+                .max_h(px(280.0))
+                .overflow_y_scroll()
+                .children(self.outputs.iter().enumerate().map(|(index, output)| {
+                    let id = output.id.clone();
+                    let selected = self.output.as_deref() == Some(output.id.as_str());
+                    let detail = if output.default {
+                        format!("{} · OS default", output.backend)
+                    } else {
+                        output.backend.clone()
+                    };
+                    output_row(
+                        ("audio-output", index),
+                        output.name.clone(),
+                        detail,
+                        selected,
+                        cx.listener(move |this, _event, _window, cx| {
+                            this.select_output(Some(id.clone()), cx);
+                        }),
+                    )
+                }));
+            menu = menu.child(list).child(
+                div()
+                    .px_3()
+                    .py_2()
+                    .border_t_1()
+                    .border_color(theme::LINE)
+                    .text_size(px(9.0))
+                    .line_height(px(12.0))
+                    .text_color(theme::FAINT)
+                    .child(if cfg!(target_os = "windows") {
+                        "WASAPI is built in. ASIO devices appear in builds made with --features asio."
+                    } else if cfg!(target_os = "macos") {
+                        "CoreAudio devices are available directly."
+                    } else {
+                        "Available CPAL output backends are shown above."
+                    }),
+            );
+            let menu = if self.settings_motion == 0 {
+                menu.into_any_element()
+            } else {
+                let opening = self.settings_open;
+                menu.with_animation(
+                    ("settings-menu", self.settings_motion),
+                    Animation::new(TINT).with_easing(ease_in_out),
+                    move |menu, delta| menu.opacity(if opening { delta } else { 1.0 - delta }),
+                )
+                .into_any_element()
+            };
+            div()
+                .id("settings-dismiss")
+                .absolute()
+                .top_0()
+                .right_0()
+                .bottom_0()
+                .left_0()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _event, _window, cx| {
+                        this.set_settings_open(false, cx);
+                    }),
+                )
+                .child(menu)
+                .into_any_element()
+        })
+    }
+
+    fn training_menu(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        (self.training_open || self.training_motion != 0).then(|| {
+            let menu = div()
+                .id("training-menu")
+                .absolute()
+                .top(px(38.0))
+                .right(px(150.0))
+                .w(px(264.0))
+                .rounded(theme::RADIUS)
+                .border_1()
+                .border_color(theme::LINE)
+                .bg(theme::PANEL)
+                .shadow_md()
+                .flex()
+                .flex_col()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|_this, _event, _window, cx| cx.stop_propagation()),
+                )
+                .child(
+                    div()
+                        .px_3()
+                        .py_3()
+                        .border_b_1()
+                        .border_color(theme::LINE)
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(
+                            div()
+                                .text_size(px(9.0))
+                                .text_color(theme::FAINT)
+                                .child("ACTIVE INSPECTOR TRAINING"),
+                        )
+                        .child(
+                            div()
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .text_sm()
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .text_color(theme::INK)
+                                .child(self.training.name().to_owned()),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(if self.training.calibrated() {
+                                    theme::ACCENT
+                                } else {
+                                    theme::MUTED
+                                })
+                                .child(self.training.summary()),
+                        ),
+                )
+                .child(
+                    div()
+                        .id("import-clean")
+                        .h(px(42.0))
+                        .px_3()
+                        .flex()
+                        .items_center()
+                        .cursor_pointer()
+                        .hover(|node| node.bg(theme::HOVER))
+                        .on_click(cx.listener(|this, _event, _window, cx| {
+                            this.import_clean(cx);
+                        }))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .child(div().text_sm().child("Import Clean Audio"))
+                                .child(
+                                    div()
+                                        .text_size(px(9.0))
+                                        .text_color(theme::FAINT)
+                                        .child("Build and replace the clean reference"),
+                                ),
+                        ),
+                )
+                .child(
+                    div()
+                        .id("import-training")
+                        .h(px(42.0))
+                        .px_3()
+                        .flex()
+                        .items_center()
+                        .cursor_pointer()
+                        .hover(|node| node.bg(theme::HOVER))
+                        .on_click(cx.listener(|this, _event, _window, cx| {
+                            this.import_training(cx);
+                        }))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .child(div().text_sm().child("Import Training File"))
+                                .child(
+                                    div()
+                                        .text_size(px(9.0))
+                                        .text_color(theme::FAINT)
+                                        .child("Restore a portable .musp-training profile"),
+                                ),
+                        ),
+                )
+                .child(
+                    div()
+                        .id("export-training")
+                        .h(px(42.0))
+                        .px_3()
+                        .border_t_1()
+                        .border_color(theme::LINE)
+                        .flex()
+                        .items_center()
+                        .cursor_pointer()
+                        .hover(|node| node.bg(theme::HOVER))
+                        .on_click(cx.listener(|this, _event, _window, cx| {
+                            this.export_training(cx);
+                        }))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .child(div().text_sm().child("Export Current Training"))
+                                .child(
+                                    div()
+                                        .text_size(px(9.0))
+                                        .text_color(theme::FAINT)
+                                        .child("Copy this profile to another computer"),
+                                ),
+                        ),
+                );
+            let menu = if self.training_motion == 0 {
+                menu.into_any_element()
+            } else {
+                let opening = self.training_open;
+                menu.with_animation(
+                    ("training-menu", self.training_motion),
+                    Animation::new(TINT).with_easing(ease_in_out),
+                    move |menu, delta| menu.opacity(if opening { delta } else { 1.0 - delta }),
+                )
+                .into_any_element()
+            };
+            div()
+                .id("training-dismiss")
+                .absolute()
+                .top_0()
+                .right_0()
+                .bottom_0()
+                .left_0()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _event, _window, cx| {
+                        this.set_training_open(false, cx);
+                    }),
+                )
+                .child(menu)
+                .into_any_element()
+        })
     }
 
     fn overview(&self, report: &Report, cx: &mut Context<Self>) -> AnyElement {
@@ -2776,6 +4462,69 @@ impl Muspector {
             .into_any_element()
     }
 
+    fn selection_context_menu(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let menu = self.selection_menu?;
+        let can_paste = self.clipboard.is_some();
+        Some(
+            div()
+                .id("selection-menu")
+                .absolute()
+                .left(menu.position.x)
+                .top(menu.position.y)
+                .w(px(196.0))
+                .py_1()
+                .rounded(theme::RADIUS)
+                .border_1()
+                .border_color(theme::LINE)
+                .bg(theme::PANEL)
+                .shadow_md()
+                .flex()
+                .flex_col()
+                .cursor_default()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|_this, _event, _window, cx| cx.stop_propagation()),
+                )
+                .child(context_row(
+                    "selection-copy",
+                    "Copy",
+                    shortcut("C"),
+                    true,
+                    cx.listener(|this, _event, _window, cx| this.copy_selection(cx)),
+                ))
+                .child(context_row(
+                    "selection-paste",
+                    "Paste",
+                    shortcut("V"),
+                    can_paste,
+                    cx.listener(|this, _event, _window, cx| this.edit_audio(AudioEdit::Paste, cx)),
+                ))
+                .child(context_row(
+                    "selection-delete",
+                    "Delete",
+                    "⌫".to_owned(),
+                    true,
+                    cx.listener(|this, _event, _window, cx| this.edit_audio(AudioEdit::Delete, cx)),
+                ))
+                .child(div().h(px(1.0)).my_1().bg(theme::LINE))
+                .child(context_row(
+                    "selection-export",
+                    "Quick Export WAV",
+                    shortcut("E"),
+                    true,
+                    cx.listener(|this, _event, _window, cx| this.quick_export(cx)),
+                ))
+                .child(context_row(
+                    "selection-all",
+                    "Select All",
+                    shortcut("A"),
+                    true,
+                    cx.listener(|this, _event, _window, cx| this.select_all(cx)),
+                ))
+                .into_any_element(),
+        )
+    }
+
     fn profile(&self, report: &Report, cx: &mut Context<Self>) -> AnyElement {
         let points = report.profile.points.clone();
         let duration = report.duration;
@@ -2799,6 +4548,7 @@ impl Muspector {
         let capture = bounds.clone();
         let locate = bounds.clone();
         let begin = bounds.clone();
+        let context = bounds.clone();
         let pan_begin = bounds.clone();
         let wheel = bounds.clone();
         #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -3114,9 +4864,37 @@ impl Muspector {
                         return;
                     };
                     let position = this.view + horizontal(event.position.x, area) / this.zoom;
+                    this.selection_menu = None;
                     this.drag = Some(position);
                     this.selection = Some((position, position));
                     this.cursor = Some(position);
+                    cx.notify();
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                    let Some(area) = *context.borrow() else {
+                        return;
+                    };
+                    let position = this.view + horizontal(event.position.x, area) / this.zoom;
+                    let inside = this
+                        .selection
+                        .map(|range| ordered(range.0, range.1))
+                        .is_some_and(|range| (range.0..=range.1).contains(&position));
+                    if !inside {
+                        this.selection_menu = None;
+                        cx.notify();
+                        return;
+                    }
+                    let x = (f32::from(event.position.x - area.origin.x))
+                        .clamp(4.0, (f32::from(area.size.width) - 200.0).max(4.0));
+                    let y = (f32::from(event.position.y - area.origin.y))
+                        .clamp(4.0, (f32::from(area.size.height) - 152.0).max(4.0));
+                    this.selection_menu = Some(SelectionMenu {
+                        position: point(px(x), px(y)),
+                    });
+                    cx.stop_propagation();
                     cx.notify();
                 }),
             )
@@ -3220,7 +4998,8 @@ impl Muspector {
                 }
                 cx.stop_propagation();
                 cx.notify();
-            }));
+            }))
+            .children(self.selection_context_menu(cx));
 
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         let plot = plot.on_pinch(cx.listener(move |this, event: &PinchEvent, _, cx| {
@@ -3920,6 +5699,22 @@ impl Render for Muspector {
             .text_color(theme::INK)
             .flex()
             .flex_col()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _event, _window, cx| {
+                    if this.selection_menu.take().is_some() {
+                        cx.notify();
+                    }
+                }),
+            )
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _event, _window, cx| this.finish_tab_drag(cx)),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, _event, _window, cx| this.finish_tab_drag(cx)),
+            )
             .on_drop(cx.listener(|this, paths: &ExternalPaths, _window, cx| {
                 if let Some(path) = paths.paths().first() {
                     this.start(path.clone(), cx);
@@ -3937,7 +5732,115 @@ impl Render for Muspector {
                     .child(bar(&self.tracks[0])),
             )
             .children(self.toast())
+            .children(self.training_menu(cx))
+            .children(self.settings_menu(cx))
     }
+}
+
+fn output_row(
+    id: impl Into<ElementId>,
+    name: String,
+    detail: String,
+    selected: bool,
+    click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> AnyElement {
+    div()
+        .id(id)
+        .h(px(44.0))
+        .px_3()
+        .flex_none()
+        .flex()
+        .items_center()
+        .gap_2()
+        .cursor_pointer()
+        .hover(|node| node.bg(theme::HOVER))
+        .on_click(click)
+        .child(
+            div()
+                .size(px(8.0))
+                .rounded_full()
+                .flex_none()
+                .bg(if selected { theme::ACCENT } else { theme::LINE }),
+        )
+        .child(
+            div()
+                .min_w_0()
+                .flex_1()
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_sm()
+                        .text_color(if selected { theme::INK } else { theme::MUTED })
+                        .child(name),
+                )
+                .child(
+                    div()
+                        .text_size(px(9.0))
+                        .text_color(theme::FAINT)
+                        .child(detail),
+                ),
+        )
+        .into_any_element()
+}
+
+fn context_row(
+    id: &'static str,
+    label: &'static str,
+    key: String,
+    enabled: bool,
+    click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> AnyElement {
+    let row = div()
+        .id(id)
+        .h(px(28.0))
+        .px_2()
+        .opacity(if enabled { 1.0 } else { 0.35 })
+        .flex()
+        .items_center()
+        .justify_between()
+        .text_xs()
+        .text_color(theme::INK)
+        .child(label)
+        .child(div().text_size(px(9.0)).text_color(theme::FAINT).child(key));
+    if enabled {
+        row.cursor_pointer()
+            .hover(|node| node.bg(theme::HOVER))
+            .on_click(click)
+            .into_any_element()
+    } else {
+        row.into_any_element()
+    }
+}
+
+fn shortcut(key: &str) -> String {
+    if cfg!(target_os = "macos") {
+        format!("⌘{key}")
+    } else {
+        format!("Ctrl+{key}")
+    }
+}
+
+fn selection_path(source: &Path) -> PathBuf {
+    let parent = source.parent().unwrap_or_else(|| Path::new("."));
+    let stem = source
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("audio");
+    for suffix in 1..=9_999 {
+        let name = if suffix == 1 {
+            format!("{stem}-selection.wav")
+        } else {
+            format!("{stem}-selection-{suffix}.wav")
+        };
+        let target = parent.join(name);
+        if !target.exists() {
+            return target;
+        }
+    }
+    parent.join(format!("{stem}-selection-{}.wav", std::process::id()))
 }
 
 fn scroll_size(handle: &ScrollHandle, height: f32) -> Option<(f32, f32)> {
@@ -4861,31 +6764,67 @@ mod tests {
         })
     }
 
+    fn revision(chain: Chain) -> Rc<Revision> {
+        Rc::new(Revision {
+            report: Box::new(Report {
+                path: PathBuf::from("test.wav"),
+                codec: "WAV".to_owned(),
+                rate: 48_000,
+                channels: 1,
+                duration: 1.0,
+                peak: -1.0,
+                rms: -12.0,
+                loudness: -13.0,
+                crest: 11.0,
+                centroid: 1_000.0,
+                rolloff: 4_000.0,
+                low: -6.0,
+                mid: -4.0,
+                high: -14.0,
+                clips: 0,
+                spectrum: Vec::new(),
+                profile: analysis::Profile { points: Vec::new() },
+                chain,
+            }),
+            source: PathBuf::from("test.wav"),
+            audio_dirty: false,
+        })
+    }
+
+    fn snapshot(chain: Chain, baseline: Chain, revision: Rc<Revision>, dirty: bool) -> Snapshot {
+        Snapshot {
+            chain,
+            revision,
+            baseline,
+            dirty,
+            expanded: [false; 6],
+            selection: None,
+            playhead: None,
+            looped: false,
+        }
+    }
+
     #[test]
     fn history_merges_gestures_and_discards_redo() {
         let baseline = chain();
-        let mut history = History::detected(baseline.clone(), baseline.clone(), [false; 6]);
+        let revision = revision(baseline.clone());
+        let mut history = History::detected(snapshot(
+            baseline.clone(),
+            baseline.clone(),
+            revision.clone(),
+            false,
+        ));
         let mut adjusted = baseline.clone();
         adjusted.effects[0].params[0].shift(1.0);
         history.record(
             "Adjust Gate Threshold".to_owned(),
-            Snapshot {
-                chain: adjusted.clone(),
-                baseline: baseline.clone(),
-                dirty: true,
-                expanded: [false; 6],
-            },
+            snapshot(adjusted.clone(), baseline.clone(), revision.clone(), true),
             true,
         );
         adjusted.effects[0].params[0].shift(1.0);
         history.record(
             "Adjust Gate Threshold".to_owned(),
-            Snapshot {
-                chain: adjusted,
-                baseline: baseline.clone(),
-                dirty: true,
-                expanded: [false; 6],
-            },
+            snapshot(adjusted, baseline.clone(), revision.clone(), true),
             true,
         );
         assert_eq!(history.entries.len(), 2);
@@ -4897,16 +6836,40 @@ mod tests {
         toggled.effects[0].active = !toggled.effects[0].active;
         history.record(
             "Enable Gate".to_owned(),
-            Snapshot {
-                chain: toggled,
-                baseline,
-                dirty: true,
-                expanded: [false; 6],
-            },
+            snapshot(toggled, baseline, revision, true),
             false,
         );
         assert_eq!(history.entries.len(), 2);
         assert_eq!(history.entries[1].label, "Enable Gate");
+    }
+
+    #[test]
+    fn history_keeps_audio_revisions_for_undo_and_redo() {
+        let baseline = chain();
+        let original = revision(baseline.clone());
+        let mut history = History::detected(snapshot(
+            baseline.clone(),
+            baseline.clone(),
+            original.clone(),
+            false,
+        ));
+        let edited = Rc::new(Revision {
+            report: original.report.clone(),
+            source: PathBuf::from("edited.wav"),
+            audio_dirty: true,
+        });
+
+        history.record(
+            "Delete selection".to_owned(),
+            snapshot(baseline.clone(), baseline, edited.clone(), true),
+            false,
+        );
+
+        assert_eq!(history.entries.len(), 2);
+        assert!(Rc::ptr_eq(&history.entries[0].snapshot.revision, &original));
+        assert!(Rc::ptr_eq(&history.entries[1].snapshot.revision, &edited));
+        assert_eq!(history.entries[1].label, "Delete selection");
+        assert!(history.entries[1].snapshot.revision.audio_dirty);
     }
 
     #[test]

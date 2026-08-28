@@ -1,0 +1,33 @@
+Muspector
+
+Muspector source code is licensed under the Apache License 2.0. Third-party
+assets and model artifacts retain their own licenses and restrictions.
+
+Inspector model artifacts
+-------------------------
+
+The public-RIR Reverb encoder/head remain separate CC BY 4.0 artifacts. The
+public-effects Drive/Delay branch is integrated as a local non-commercial research
+candidate and uses Spotify Pedalboard only as an unbundled GPL-3.0 training
+tool. These artifacts are not under the repository's Apache-2.0 license. See:
+
+The bundled temporal Reverb verifier is a local non-commercial research
+artifact fitted with private hardware-development recordings plus public
+replay. The recordings are not redistributed, and the verifier is not yet
+release-qualified because no untouched device-disjoint hardware test exists.
+
+  models/inspector/LICENSES.md
+  models/inspector/README.md
+  train/LICENSES.md
+
+Release weights use the DAFx25 guitar effect-chain corpus, Aachen chapel room
+responses, EGFxSet, Guitar-TECHS, and GuitarSet (all CC BY 4.0), plus GuitarJam
+(CC0 1.0). IDMT, RemFX, and other restricted research controls are excluded.
+No source-dataset audio or room response is included in this repository.
+
+Other third-party components
+----------------------------
+
+Interface icons from Lucide are ISC licensed; attribution is in
+assets/icons/LUCIDE.md. Rust dependency licenses are recorded by their upstream
+packages and summarized in README.md.

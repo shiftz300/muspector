@@ -49,6 +49,18 @@ impl AssetSource for Assets {
             "icons/audio.svg" => Ok(Some(Cow::Borrowed(include_bytes!(
                 "../assets/icons/audio.svg"
             )))),
+            "icons/check.svg" => Ok(Some(Cow::Borrowed(include_bytes!(
+                "../assets/icons/check.svg"
+            )))),
+            "icons/circle-x.svg" => Ok(Some(Cow::Borrowed(include_bytes!(
+                "../assets/icons/circle-x.svg"
+            )))),
+            "icons/info.svg" => Ok(Some(Cow::Borrowed(include_bytes!(
+                "../assets/icons/info.svg"
+            )))),
+            "icons/triangle-alert.svg" => Ok(Some(Cow::Borrowed(include_bytes!(
+                "../assets/icons/triangle-alert.svg"
+            )))),
             "icons/undo.svg" => Ok(Some(Cow::Borrowed(include_bytes!(
                 "../assets/icons/undo.svg"
             )))),
@@ -83,6 +95,12 @@ impl AssetSource for Assets {
                 "../assets/icons/minus.svg"
             )))),
             "icons/x.svg" => Ok(Some(Cow::Borrowed(include_bytes!("../assets/icons/x.svg")))),
+            "icons/wave.svg" => Ok(Some(Cow::Borrowed(include_bytes!(
+                "../assets/icons/wave.svg"
+            )))),
+            "icons/settings.svg" => Ok(Some(Cow::Borrowed(include_bytes!(
+                "../assets/icons/settings.svg"
+            )))),
             _ => Ok(None),
         }
     }
@@ -92,6 +110,10 @@ impl AssetSource for Assets {
             "" => vec!["AppIcon.png".into()],
             "icons" => vec![
                 "icons/audio.svg".into(),
+                "icons/check.svg".into(),
+                "icons/circle-x.svg".into(),
+                "icons/info.svg".into(),
+                "icons/triangle-alert.svg".into(),
                 "icons/undo.svg".into(),
                 "icons/redo.svg".into(),
                 "icons/play.svg".into(),
@@ -104,6 +126,8 @@ impl AssetSource for Assets {
                 "icons/plus.svg".into(),
                 "icons/minus.svg".into(),
                 "icons/x.svg".into(),
+                "icons/wave.svg".into(),
+                "icons/settings.svg".into(),
             ],
             _ => Vec::new(),
         })

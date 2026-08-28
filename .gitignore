@@ -21,3 +21,12 @@ target
 #.idea/
 
 .DS_Store
+
+# Local model-training environment and downloaded datasets
+.venv/
+.venv310/
+data/
+__pycache__/
+*.py[cod]
+train/runs/
+train/cache/

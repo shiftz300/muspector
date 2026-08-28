@@ -1,0 +1,137 @@
+{
+  "egfxset": {
+    "title": "EGFxSet",
+    "record": "https://zenodo.org/records/7044411",
+    "license": "CC-BY-4.0",
+    "files": [
+      ["Clean.zip", 431036829, "cdb1b401960f56becc8640387910e78a"],
+      ["BluesDriver.zip", 486282388, "b1d6dce9064a25a1cff2a0c40c30a2e4"],
+      ["TubeScreamer.zip", 471923566, "b9c46ed65037d0bd17bdf82dc3125beb"],
+      ["RAT.zip", 487361491, "afe9fc757a51d04126c23159706f4e8e"],
+      ["Digital-Delay.zip", 431762831, "4a25d57bcb0083667bade7b3c42460bc"],
+      ["TapeEcho.zip", 437933126, "77adf4a6a8ed4eb566b2b8e77735c7dc"],
+      ["Sweep-Echo.zip", 436888284, "ea6dda440e9af6a19173facdf2bf17ac"],
+      ["Plate-Reverb.zip", 433469529, "abbcc68d692f323e8af6aeb8d478c40d"],
+      ["Hall-Reverb.zip", 443452670, "c173bebdcbed50d4bc8803e0b30d6517"],
+      ["Spring-Reverb.zip", 442162173, "21afc47594ed8f37db008f313e50c634"],
+      ["Chorus.zip", 440084981, "3698b3b1756917f93dadf27517d48479"],
+      ["Flanger.zip", 442229457, "f3f7b39c895a400d35c5b1314a1122bd"],
+      ["Phaser.zip", 428640814, "1842e2643dd34d7285a77506ca540df3"]
+    ]
+  },
+  "guitar-techs": {
+    "title": "Guitar-TECHS",
+    "record": "https://zenodo.org/records/14963133",
+    "license": "CC-BY-4.0",
+    "files": [
+      ["P1_singlenotes.zip", 108626613, "ca0c4674dde3805574685a313f7c39eb"],
+      ["P1_chords.zip", 981741162, "be9ef8bbdceb1912d565254e607a6d94"],
+      ["P1_scales.zip", 453349723, "9c0b98e8fb42a522df727ea8bf545e4f"],
+      ["P1_techniques.zip", 326280863, "18634a41a6db5a8de10d07eb3122a872"],
+      ["P2_singlenotes.zip", 116133457, "40fbf03d8b04bb2cf42df20f36dc2254"],
+      ["P2_chords.zip", 1150819056, "eb6f74dd19162237189281688ad7ad2e"],
+      ["P2_scales.zip", 471254783, "96664853872f51e5f8aa4447313b7cf5"],
+      ["P2_techniques.zip", 395839610, "f4189251ce50be25f06a173b2c2bba00"],
+      ["P3_music.zip", 129505089, "071ba80aecf00f4a31fbd167b3f22198"]
+    ]
+  },
+  "guitarset": {
+    "title": "GuitarSet",
+    "record": "https://zenodo.org/records/3371780",
+    "license": "CC-BY-4.0",
+    "files": [
+      ["audio_mono-mic.zip", 656927981, "275966d6610ac34999b58426beb119c3"],
+      ["audio_mono-pickup_mix.zip", 683145360, "aecce79f425a44e2055e46f680e10f6a"]
+    ]
+  },
+  "guitarjam": {
+    "title": "GuitarJam",
+    "repository": "https://huggingface.co/datasets/Julian-br/GuitarJam",
+    "revision": "2d467bfec90af19301b01123494f4b2ba64c5a3a",
+    "license": "CC0-1.0",
+    "method": "git-lfs"
+  },
+  "guitar-effects-chains": {
+    "title": "Guitar improvisations with chains of five effects",
+    "record": "https://zenodo.org/records/7871720",
+    "license": "CC-BY-4.0",
+    "files": [
+      [
+        "DATASET_guitar_effects.zip",
+        32969803616,
+        "56773ca55a4eb4c3be81f5c3418053a5"
+      ]
+    ]
+  },
+  "aachen-chapel-rir": {
+    "title": "Room acoustic measurement and simulation data of the St. Nicholas Chapel, Aachen Cathedral",
+    "record": "https://zenodo.org/records/20428705",
+    "license": "CC-BY-4.0",
+    "files": [
+      ["impulse_responses.zip", 271472748, "6d20fffe4ab0c3e0ce85d7774232487f"]
+    ]
+  },
+  "spotify-pedalboard": {
+    "title": "Spotify Pedalboard audio effects library",
+    "repository": "https://github.com/spotify/pedalboard",
+    "version": "0.9.24",
+    "license": "GPL-3.0",
+    "research_only": true,
+    "method": "training-time in-memory renderer; package and rendered audio are not redistributed"
+  },
+  "tonetwist-big-muff-nc": {
+    "title": "ToneTwisT AFx real Big Muff dry/wet pairs",
+    "license": "CC-BY-NC-4.0",
+    "research_only": true,
+    "records": [
+      {
+        "record": "https://zenodo.org/records/10797916",
+        "file": "DIY-ElectroHarmonix-BigMuff.zip",
+        "size": 33289033,
+        "md5": "ce517351781915dc0893aa0034438b22"
+      },
+      {
+        "record": "https://zenodo.org/records/10891515",
+        "file": "ElectroHarmonix-BigMuff.zip",
+        "size": 49975728,
+        "md5": "45bdd8ea776e1182b9db1d60f62b7930"
+      }
+    ]
+  },
+  "remfx-1-1": {
+    "title": "RemFX: Evaluation Datasets (single-effect pairs)",
+    "record": "https://zenodo.org/records/8187288",
+    "license": "CC-NC",
+    "research_only": true,
+    "files": [
+      ["1-1.zip", 1741860014, "e76fb98ed803a898c9d8c6153837008f"]
+    ]
+  },
+  "efficientat-mn04-as": {
+    "title": "EfficientAT mn04 AudioSet-pretrained model",
+    "repository": "https://github.com/fschmid56/EfficientAT",
+    "revision": "a425fdce92572e602a1d5634799bd9f1f2efa806",
+    "license": "MIT",
+    "research_only": true,
+    "checkpoint": {
+      "url": "https://github.com/fschmid56/EfficientAT/releases/download/v0.0.1/mn04_as_mAP_432.pt",
+      "sha256": "899a8c6217063f6941793102a2780b3dd788ab11fce468d9cf5f0577c453321c"
+    },
+    "pretraining_note": "AudioSet metadata is CC-BY-4.0; underlying hosted media rights vary, so the checkpoint is not redistributed by Muspector."
+  },
+  "private-hardware-development": {
+    "title": "User-recorded guitar effect and multi-pickup Clean development audio",
+    "license": "private-no-redistribution",
+    "research_only": true,
+    "method": "local labelled verifier fitting and Clean hard-negative replay; source audio is not committed or redistributed"
+  },
+  "idmt-smt-audio-effects": {
+    "title": "IDMT-SMT-Audio-Effects Dataset",
+    "record": "https://zenodo.org/records/7544032",
+    "license": "CC-BY-NC-ND-4.0",
+    "research_only": true,
+    "files": [
+      ["IDMT-SMT-AUDIO-EFFECTS.zip", 6454496906, "91e845a1b347352993ebd5ba948d5a7c"]
+    ]
+  }
+}

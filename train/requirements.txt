@@ -1,0 +1,11 @@
+torch==2.13.0
+torchaudio==2.11.0
+torchvision==0.28.0
+pedalboard==0.9.24
+numpy==1.26.4
+scipy==1.13.1
+soundfile==0.13.1
+onnx==1.17.0
+onnxruntime==1.19.2
+tqdm==4.67.1
+pyarrow==17.0.0

@@ -7,6 +7,10 @@ license = "Apache-2.0"
 description = "A compact audio inspector built with GPUI"
 build = "build.rs"
 
+[features]
+default = []
+asio = ["dep:cpal"]
+
 [dependencies]
 anyhow = "1.0"
 ebur128 = "0.1.10"
@@ -26,6 +30,8 @@ rodio = { version = "0.22.2", default-features = false, features = [
     "symphonia-wav",
 ] }
 rubato = "4.0.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 symphonia = { version = "0.5.5", default-features = false, features = [
     "aac",
     "alac",
@@ -39,6 +45,9 @@ symphonia = { version = "0.5.5", default-features = false, features = [
 ] }
 sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }
 tract-onnx = "0.23.4"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+cpal = { version = "0.17.3", optional = true, features = ["asio"] }
 
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"
