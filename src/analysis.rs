@@ -991,7 +991,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires MUSPECTOR_DEVICE_FIXTURE with the private labelled WAV directory"]
+    #[ignore = "requires MUSPECTOR_DEVICE_FIXTURE and the local AFx identity model"]
     fn inspector_device_fixture_matches_labels() {
         let root = PathBuf::from(
             std::env::var("MUSPECTOR_DEVICE_FIXTURE")
@@ -1008,6 +1008,8 @@ mod tests {
         let mut false_positive = [0_usize; 3];
         let mut false_negative = [0_usize; 3];
         let mut exact = 0_usize;
+        let mut identity_rat = [0_usize; 2];
+        let mut identity_non_catalog = [0_usize; 2];
         for path in paths {
             let report = inspect(&path).unwrap();
             let name = path
@@ -1044,10 +1046,29 @@ mod tests {
                     .find(|effect| effect.kind == kind)
                     .map_or(0.0, |effect| effect.score)
             });
+            let drive_model = report
+                .chain
+                .effects
+                .iter()
+                .find(|effect| effect.kind == Kind::Drive)
+                .and_then(|effect| effect.model.as_deref());
+            let drive_evidence = report
+                .chain
+                .effects
+                .iter()
+                .find(|effect| effect.kind == Kind::Drive)
+                .map(|effect| effect.evidence.as_str());
             println!(
-                "{} expected {expected:?} actual {actual:?} scores {scores:?}",
+                "{} expected {expected:?} actual {actual:?} scores {scores:?} model {drive_model:?} evidence {drive_evidence:?}",
                 path.display()
             );
+            if name.contains("rat") {
+                identity_rat[1] += 1;
+                identity_rat[0] += usize::from(drive_model == Some("RAT"));
+            } else if name.contains("drive") || name.contains("fuzz") {
+                identity_non_catalog[1] += 1;
+                identity_non_catalog[0] += usize::from(drive_model.is_some());
+            }
             exact += usize::from(actual == expected);
             for index in 0..3 {
                 true_positive[index] += usize::from(expected[index] && actual[index]);
@@ -1058,6 +1079,8 @@ mod tests {
                 assert_eq!(actual, [false; 3], "{}", path.display());
             }
         }
+        assert!(identity_rat[0] * 2 >= identity_rat[1]);
+        assert!(identity_non_catalog[0] * 5 <= identity_non_catalog[1]);
         for index in 0..3 {
             let recall =
                 true_positive[index] as f64 / (true_positive[index] + false_negative[index]) as f64;

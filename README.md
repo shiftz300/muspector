@@ -14,7 +14,8 @@ the original audio without applying the proposed chain.
 - macOS, Windows, or a Vulkan-capable X11/Wayland Linux desktop
 
 The CI artifacts currently target Apple silicon macOS, x86-64 Windows, and
-x86-64 Linux.
+x86-64 Linux. Those rolling artifacts are non-commercial research builds
+because they embed the separately licensed pedal-identity model.
 
 ## Run
 
@@ -78,8 +79,10 @@ runners and uploads each result as a single, unwrapped artifact:
 Release builds use `opt-level=3`, fat LTO, one codegen unit, aborted panics, and
 symbol stripping to keep model inference and visualization hot paths fast while
 removing avoidable binary overhead. All GPUI assets and the application PNG are
-compiled into the executable. Windows also embeds the icon and product metadata
-in its native PE resources. macOS artifacts are ad-hoc signed; downloaded Linux
+compiled into the executable. The rolling Release also compiles the 323.8 MB
+pedal-identity ONNX into each executable via `embedded-identity`; ordinary
+developer builds keep that feature optional. Windows also embeds the icon and
+product metadata in its native PE resources. macOS artifacts are ad-hoc signed; downloaded Linux
 and macOS artifacts may need their executable permission restored with
 `chmod +x` depending on the download client.
 
@@ -186,6 +189,17 @@ normalized log-Mel bins. The routed non-aligned Clean-reference model uses the
 public-effects branch for Drive/Delay and the public-RIR branch for Reverb. Python is not
 required at runtime.
 
+The non-commercial research build can add concrete Drive model names when the
+routed detector finds an isolated Drive without Delay or Reverb. It uses a frozen AFx-Rep Cnn14 encoder,
+a seven-model global catalog, and an independent knownness verifier; it selects
+at most three high-energy five-second windows at 48 kHz. This branch is
+pretrained by the developer and does not use the imported Clean profile, train
+on the user's computer, or register the user's pedals. If a developer build
+omits the `embedded-identity` feature or rejects the recording, the card remains
+the generic `Drive` family. The
+rolling non-commercial Release embeds this model; its fitted heads use
+non-commercial ToneTwist and RemFX data and are not covered by Apache-2.0.
+
 The Wave menu makes the reference replaceable. A Clean import uses at most the
 first ten seconds to compute separate Drive/Delay and Reverb frozen-encoder profiles and
 routed clean-derived thresholds. It performs zero gradient updates, requires no
@@ -224,6 +238,12 @@ release gate still requires an untouched device-disjoint labelled hardware set.
 - A `.musp-training` schema-4 file contains the user's derived reference statistics
   and thresholds, not shared encoder/head weights or audio. Its use still
   depends on the user's rights to the imported recording.
+- The AFx pedal-identity package is a separate non-commercial
+  research artifact. Its upstream AFx-Rep encoder is Apache-2.0, while its
+  fitted catalog/verifier heads depend on CC BY-NC 4.0 ToneTwist and Zenodo
+  `cc-nc` RemFX recordings. GitHub rolling releases embed it under the separate
+  notice in `models/inspector/AFX_PEDAL_IDENTITY_NOTICE.md`; this does not make
+  the model or the combined research build commercially usable.
 - Hashes, attribution, artifact boundaries, and upstream links are in
   `models/inspector/LICENSES.md`, `train/LICENSES.md`, and `NOTICE`.
 - `tract-onnx`: MIT or Apache-2.0; runs the checked-in ONNX models in Rust.
@@ -256,6 +276,7 @@ Inspector artifacts.
 - `project`: durable effect-chain metadata and edited-audio save coordination
 - `blind`: routed Inspector preprocessing, dual-pair inference, and chain
   classification
+- `identity`: optional fixed global pedal-catalog inference; no user training
 - `chain`: effect inference and parameter models
 - `models`: attributed inference weights
 - `assets`: embedded interface icons

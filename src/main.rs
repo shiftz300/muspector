@@ -8,6 +8,7 @@ mod blind;
 mod chain;
 mod clip;
 mod icon;
+mod identity;
 mod project;
 mod theme;
 

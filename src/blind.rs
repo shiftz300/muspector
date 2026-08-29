@@ -1,4 +1,7 @@
-use crate::chain::{Chain, Kind};
+use crate::{
+    chain::{Chain, Kind},
+    identity,
+};
 use anyhow::{Context, Result, bail};
 use realfft::{RealFftPlanner, RealToComplex};
 use rubato::{Fft, FixedSync, Resampler, audioadapter_buffers::owned::InterleavedOwned};
@@ -67,6 +70,7 @@ pub struct Match {
     scores: [f64; 3],
     detected: [bool; 3],
     windows: usize,
+    identity: Option<identity::Match>,
 }
 
 pub struct Scan {
@@ -347,6 +351,25 @@ impl Match {
                 ),
             ),
         ]);
+        if let Some(identity) = &self.identity
+            && let Some(drive) = chain
+                .effects
+                .iter_mut()
+                .find(|effect| effect.kind == Kind::Drive && effect.active)
+        {
+            drive.model.clone_from(&identity.model);
+            drive.evidence.push_str(&format!(
+                "\nAFx pedal catalog · {} window{} · {:.0}%{}",
+                identity.windows,
+                plural(identity.windows),
+                identity.score * 100.0,
+                if identity.model.is_some() {
+                    ""
+                } else {
+                    " · no known model"
+                }
+            ));
+        }
     }
 }
 
@@ -421,6 +444,11 @@ fn infer(samples: &[f32], rate: u32, training: &Training) -> Result<Match> {
         scores,
         detected,
         windows: starts.len(),
+        identity: if detected[0] && !detected[1] && !detected[2] {
+            identity::infer(samples, rate).ok().flatten()
+        } else {
+            None
+        },
     })
 }
 

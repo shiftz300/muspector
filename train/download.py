@@ -135,10 +135,29 @@ def download_file(name: str, root: Path, entry: list) -> None:
                 f"MD5 mismatch for {archive}: expected {expected}, got {actual}"
             )
     print(f"extract  {name}/{filename}", flush=True)
+    if source.get("multipart_zip"):
+        return
     if name == "idmt-smt-audio-effects":
         extract_idmt_guitar(archive, root)
     else:
         extract(archive, root / "corpus" / name / Path(filename).stem)
+
+
+def extract_multipart(name: str, root: Path) -> None:
+    source = SOURCES[name]
+    archives = root / "downloads" / name
+    zip_name = next(entry[0] for entry in source["files"] if entry[0].endswith(".zip"))
+    archive = archives / zip_name
+    output = root / "corpus" / name / Path(zip_name).stem
+    marker = output / ".complete"
+    if marker.exists():
+        return
+    combined = archives / f"{Path(zip_name).stem}-combined.zip"
+    if not combined.exists():
+        subprocess.run(
+            ["zip", "-s", "0", str(archive), "--out", str(combined)], check=True
+        )
+    extract(combined, output)
 
 
 def download_git(name: str, root: Path) -> None:
@@ -226,6 +245,9 @@ def main() -> None:
         )
         for future in concurrent.futures.as_completed(futures):
             future.result()
+    for source in selected:
+        if SOURCES[source].get("multipart_zip"):
+            extract_multipart(source, args.root)
 
 
 if __name__ == "__main__":

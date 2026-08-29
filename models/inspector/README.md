@@ -16,6 +16,11 @@ Active artifacts use semantic names describing their role and training domain:
   pass their thresholds.
 - `routed-device-profile.bin`: 1,036 little-endian float32 values containing
   Drive/Delay and Reverb mean/deviation statistics for the development Clean.
+- `afx-pedal-identity.onnx`: 323.8 MB frozen AFx-Rep encoder plus seven-pedal
+  catalog and open-set verifier, embedded only by the `embedded-identity`
+  feature and distributed under the separate non-commercial notice.
+- `afx-pedal-identity.json`: labels, calibrated threshold, model hash, and
+  runtime/license contract for the embedded identity model.
 
 Both branches use 44.1 kHz five-second windows, a 2048-point FFT, a 1024-sample
 STFT hop, and 128 normalized log-Mel bins. Importing Clean Audio uses the first
@@ -64,6 +69,8 @@ not create new sequence-number run names.
 - `routed-device-profile.bin`: `fc753c62c1c939fa63b34728ed442987d2f67e5129c37c06fdb4d4acec5f5ac4`
 - bundled development Reverb verifier ONNX:
   `127a0180f081316fe640502feb7212de6867701e8ee1ee6216e0251fb0df5e80`
+- `afx-pedal-identity.onnx`:
+  `977c0e4a2f0ca4a61cf899df0c7a3fd03da41060db78a5aaee20ca7be32d8403`
 
 The model recognizes effect families, not effect order, exact settings, or
 Clean-audio reconstruction. See `LICENSES.md` before redistribution.

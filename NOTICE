@@ -20,9 +20,18 @@ release-qualified because no untouched device-disjoint hardware test exists.
   models/inspector/README.md
   train/LICENSES.md
 
-Release weights use the DAFx25 guitar effect-chain corpus, Aachen chapel room
+The rolling non-commercial research Release also embeds
+`afx-pedal-identity.onnx`. Its AFx-Rep encoder is Apache-2.0, while its fitted
+catalog/verifier heads use ToneTwisT CC BY-NC 4.0 and RemFX `cc-nc` data. The
+model is not Apache-2.0 and may not be used for commercial purposes. Full
+attribution and the modification notice are in:
+
+  models/inspector/AFX_PEDAL_IDENTITY_NOTICE.md
+
+The routed family-detector weights use the DAFx25 guitar effect-chain corpus, Aachen chapel room
 responses, EGFxSet, Guitar-TECHS, and GuitarSet (all CC BY 4.0), plus GuitarJam
-(CC0 1.0). IDMT, RemFX, and other restricted research controls are excluded.
+(CC0 1.0). IDMT and other restricted research controls are excluded from that
+branch; RemFX is used only by the separately licensed identity component.
 No source-dataset audio or room response is included in this repository.
 
 Other third-party components

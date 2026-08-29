@@ -39,6 +39,15 @@ The routed model and verifier do not contain or derive from
 IDMT-SMT-Audio-Effects, RemFX, ToneTwisT, Fx-Encoder++, RelFX, AFx-Rep,
 AudioSet checkpoints, or Apple Audio Unit captures.
 
+## Embedded AFx pedal identity
+
+`afx-pedal-identity.onnx` is a distinct non-commercial research component. Its
+AFx-Rep encoder is Apache-2.0; its fitted catalog and knownness heads use
+ToneTwisT CC BY-NC 4.0 pedal captures and RemFX data whose official Zenodo
+record declares `cc-nc`. It is not relicensed under Apache-2.0. Required
+authors, links, modification notice, hash, and restrictions are recorded in
+`AFX_PEDAL_IDENTITY_NOTICE.md` and `train/LICENSES.md`.
+
 ## Required upstream attribution
 
 - Guitar improvisations with chains of five effects, Michele Rossi,

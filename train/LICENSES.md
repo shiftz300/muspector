@@ -21,13 +21,13 @@ Muspector.
 - Use: clean electric-guitar DI and paired microphone/amp captures from
   different players and hardware. Both are zero-label examples for the three
   target effect families; split grouping keeps the paired performance together.
-  The v21-v24 relative experiments use the complete official P1/P2
+  The historical relative experiments use the complete official P1/P2
   chords/scales/single-notes/techniques archives: P1 remains training-only,
   P2 remains validation-only, and P3 music remains calibration/test only.
   Only DirectInput recordings enter the clean-reference relative head; MicAmp
   recordings remain excluded because their room/amp coloration is ambiguous
   with a user's Clean reference.
-  The `clean-reference-real-v1` experiment narrows this further to DI only:
+  The DI-only clean-reference experiment narrows this further:
   microphone/amp recordings are excluded because room and amp coloration are
   ambiguous with a user's Clean reference.
 
@@ -135,9 +135,9 @@ encoders and heads. It stores only the user's routed clean-reference profiles,
 thresholds, and a name. It contains no audio or wet-labelled device adapter.
 The file does not grant rights to the recording used to create it.
 
-The older IDMT/RemFX research artifacts are excluded from the runtime and repository
-model directory. Their legal caveats remain relevant only to ignored local
-research runs described below.
+Older IDMT artifacts remain excluded from runtime and release weights. RemFX is
+excluded from the routed family detector but is used by the separately
+licensed non-commercial pedal-identity component described below.
 
 ## Private hardware development recordings
 
@@ -148,12 +148,11 @@ license. The resulting verifier remains a local non-commercial research
 artifact. The labelled wet directory updates its weights and threshold, so it
 is development training data rather than an external or final evaluation set.
 
-## Investigated research artifacts excluded from release weights
+## Non-commercial identity sources and excluded research artifacts
 
-These sources are relevant research controls but are not compatible with the
-current release-weight policy. They have not entered release-model training;
-where explicitly noted they may be evaluated only in isolated, ignored local
-research runs:
+This section includes both sources used only by the separately licensed
+non-commercial identity component and research controls excluded from every
+release weight. Each entry states its boundary:
 
 - Sony Research Fx-Encoder++ code and weights:
   https://github.com/SonyResearch/Fx-Encoder_PlusPlus — CC BY-NC 4.0.
@@ -171,12 +170,32 @@ research runs:
   Muspector preserves the published EHX train/validation/test boundary and uses
   the unsplit DIY recording only for training. Wet clips are Drive positives
   and explicit Delay/Reverb hard negatives in isolated non-commercial runs;
-  they cannot contribute to the release-compatible v29 line.
+  they cannot contribute to the release-compatible public route.
+- ToneTwist pedal-identity recordings:
+  https://zenodo.org/records/10455730 (shared dry inputs with synchronization
+  markers),
+  https://zenodo.org/records/10797988 (Ibanez TS9),
+  https://zenodo.org/records/10796378 (Harley Benton Rodent, RAT-style), and
+  https://zenodo.org/records/10901417 (Multidrive Pedal Pro B-Drive,
+  Blues-Driver emulation),
+  https://zenodo.org/records/10797932 (DIY Klon Centaur),
+  https://zenodo.org/records/10794659 (Electro Harmonix Metal Muff),
+  https://zenodo.org/records/10796322 (Harley Benton Fuzzy Logic), and
+  https://zenodo.org/records/10796394 (Harley Benton Silly Fuzz) — each audio
+  record is CC BY-NC 4.0. These are
+  isolated non-commercial research positives for global pedal-identity
+  recognition, except that the five-recording Klon set is retained as an
+  unsupported open-set negative because its recording-disjoint identity test
+  failed. They never update a user profile and contribute only to the embedded
+  non-commercial identity model; they cannot enter a commercial or Apache-2.0
+  model. The public EGFxSet/DAFx-chain-only result remains a separate auditable
+  control.
 - ToneTwisT Landlord Brewers Droop Chorus and Mooer Trelicopter records:
   https://zenodo.org/records/10796408 and
   https://zenodo.org/records/10796416 — CC BY-NC 4.0. These were investigated
   as possible modulation hard negatives but were not downloaded or used in
-  v29-v46. The ToneTwisT GitHub index's MIT license covers the index code, not
+  the active identity run. The ToneTwisT GitHub index's MIT license covers the
+  index code, not
   these separately licensed audio records. The upstream Plate/Spring Reverb
   data request remains open, so these records do not add the missing target
   device diversity.
@@ -198,15 +217,17 @@ research runs:
 - ST-ITO source and AFx-Rep checkpoint:
   https://github.com/csteinmetz1/st-ito and
   https://huggingface.co/csteinmetz1/afx-rep — Apache-2.0 as published by the
-  authors. The frozen checkpoint and locally fitted probes are isolated
-  non-commercial research artifacts in this repository.
+  authors. The frozen checkpoint is embedded in the separately licensed
+  non-commercial identity artifact; locally fitted probes remain ignored
+  research artifacts.
 - RemFX source, official checkpoint, and evaluation pairs:
   https://github.com/mhrice/RemFx,
   https://zenodo.org/records/8218621, and
   https://zenodo.org/records/8187288 — source is Apache-2.0; the official
-  evaluation data is CC-NC. `1-1.zip` may be used only in the explicit
-  non-commercial research experiment and only as training data; it is not a
-  held-out RemFX benchmark after that use.
+  evaluation data record declares the custom `cc-nc` identifier. `1-1.zip` is
+  used only as non-commercial training data for the identity knownness
+  verifier; it is not a held-out RemFX benchmark after that use and cannot
+  enter a commercial or Apache-2.0 model.
 - Dynamic-SUPERB SoundEffectDetection_RemFx derivative:
   https://huggingface.co/datasets/DynamicSuperb/SoundEffectDetection_RemFx —
   the dataset card does not declare a separate license. Its audio is treated
@@ -218,9 +239,11 @@ research runs:
   MIT as published by the authors. The checkpoint was pretrained on AudioSet.
   Google's AudioSet metadata is CC BY 4.0, but that does not grant rights to
   every underlying hosted media clip. Muspector uses the checkpoint only in
-  isolated v43 research evaluation, does not redistribute it, and does not
+  an isolated EfficientAT research evaluation, does not redistribute it, and does not
   include the derived head in runtime or release artifacts.
 
-Do not distill, fine-tune, redistribute, or include these artifacts in a
-commercial Muspector release model without a separate product-license decision.
-Current use is restricted to the user's non-commercial research runs.
+Do not distill, fine-tune, redistribute, or include the NC components in a
+commercial Muspector release model without separate permissions. The embedded
+identity artifact and current rolling build are restricted to non-commercial
+research and retain the attribution in
+`models/inspector/AFX_PEDAL_IDENTITY_NOTICE.md`.

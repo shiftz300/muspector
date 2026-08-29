@@ -98,6 +98,81 @@
       }
     ]
   },
+  "tonetwist-pedal-identity-ts9-nc": {
+    "title": "ToneTwist AFx Dataset - External: Ibanez TS9",
+    "record": "https://zenodo.org/records/10797988",
+    "license": "CC-BY-NC-4.0",
+    "research_only": true,
+    "files": [
+      ["Ibanez-TS9.zip", 50822155, "d6363460c19c05020843ff6236c7ff7c"]
+    ]
+  },
+  "tonetwist-pedal-identity-dry-nc": {
+    "title": "ToneTwist AFx Dataset: Dry with markers",
+    "record": "https://zenodo.org/records/10455730",
+    "license": "CC-BY-NC-4.0",
+    "research_only": true,
+    "files": [
+      ["DRY-with-markers.zip", 865850744, "bc1d1490f6c6cfe5643c0798eb5fb5a4"]
+    ]
+  },
+  "tonetwist-pedal-identity-rodent-nc": {
+    "title": "ToneTwist AFx Dataset: Harley Benton Rodent",
+    "record": "https://zenodo.org/records/10796378",
+    "license": "CC-BY-NC-4.0",
+    "research_only": true,
+    "files": [
+      ["HarleyBenton-Rodent.zip", 2913794564, "7ab43d078cc195f7595c8b1e1fd09723"]
+    ]
+  },
+  "tonetwist-pedal-identity-bdrive-nc": {
+    "title": "ToneTwist AFx Dataset: Multidrive Pedal Pro B-Drive",
+    "record": "https://zenodo.org/records/10901417",
+    "license": "CC-BY-NC-4.0",
+    "research_only": true,
+    "multipart_zip": true,
+    "files": [
+      ["MultidrivePedalPro-B-Drive.z01", 4294967296, "537a49fe73602e6999a9530a0ef08d2d"],
+      ["MultidrivePedalPro-B-Drive.z02", 4294967296, "73cc36287e470ce9eece854e48c39841"],
+      ["MultidrivePedalPro-B-Drive.zip", 1083591746, "8d6846bd14856bf2a56cbf603cf47455"]
+    ]
+  },
+  "tonetwist-drive-open-set-klon-nc": {
+    "title": "ToneTwist AFx Dataset - External: DIY Klon Centaur",
+    "record": "https://zenodo.org/records/10797932",
+    "license": "CC-BY-NC-4.0",
+    "research_only": true,
+    "files": [
+      ["DIY-Klon-Centaur.zip", 104562792, "8617d6ceb82295ad644b30a8378fc859"]
+    ]
+  },
+  "tonetwist-drive-open-set-metal-muff-nc": {
+    "title": "ToneTwist AFx Dataset: Electro Harmonix Metal Muff",
+    "record": "https://zenodo.org/records/10794659",
+    "license": "CC-BY-NC-4.0",
+    "research_only": true,
+    "files": [
+      ["ElectroHarmonix-MetalMuff.zip", 1280320425, "b7aa8ea27d6c64be2ca531eeecec4e4e"]
+    ]
+  },
+  "tonetwist-drive-open-set-fuzzy-logic-nc": {
+    "title": "ToneTwist AFx Dataset: Harley Benton Fuzzy Logic",
+    "record": "https://zenodo.org/records/10796322",
+    "license": "CC-BY-NC-4.0",
+    "research_only": true,
+    "files": [
+      ["HarleyBenton-FuzzyLogic.zip", 1272358120, "a702262de22616643a47df5d090c68e1"]
+    ]
+  },
+  "tonetwist-drive-open-set-silly-fuzz-nc": {
+    "title": "ToneTwist AFx Dataset: Harley Benton Silly Fuzz",
+    "record": "https://zenodo.org/records/10796394",
+    "license": "CC-BY-NC-4.0",
+    "research_only": true,
+    "files": [
+      ["HarleyBenton-SillyFuzz.zip", 1197224398, "cf1433604ebfa7e68d9a9d75aca5ae53"]
+    ]
+  },
   "remfx-1-1": {
     "title": "RemFX: Evaluation Datasets (single-effect pairs)",
     "record": "https://zenodo.org/records/8187288",
