@@ -1051,23 +1051,13 @@ impl Muspector {
                 let task = cx.background_spawn(async move { analysis::training_from_clean(&path) });
                 let result = task.await;
                 let _ = view.update(cx, |this, cx| match result {
-                    Ok(training) => {
-                        let name = training.name().to_owned();
-                        match training.save_active() {
-                            Ok(()) => {
-                                this.training = training;
-                                this.success(
-                                    format!(
-                                        "Clean reference “{name}” is active · rescan open audio"
-                                    ),
-                                    cx,
-                                );
-                            }
-                            Err(error) => {
-                                this.error(format!("Could not save training: {error:#}"), cx)
-                            }
+                    Ok(training) => match training.save_active() {
+                        Ok(()) => {
+                            this.training = training;
+                            this.success("Clean reference active".to_owned(), cx);
                         }
-                    }
+                        Err(error) => this.error(format!("Could not save training: {error:#}"), cx),
+                    },
                     Err(error) => this.error(format!("Could not import clean: {error:#}"), cx),
                 });
             }
@@ -1095,21 +1085,13 @@ impl Muspector {
                 });
                 let result = task.await;
                 let _ = view.update(cx, |this, cx| match result {
-                    Ok(training) => {
-                        let name = training.name().to_owned();
-                        match training.save_active() {
-                            Ok(()) => {
-                                this.training = training;
-                                this.success(
-                                    format!("Training “{name}” is active · rescan open audio"),
-                                    cx,
-                                );
-                            }
-                            Err(error) => {
-                                this.error(format!("Could not save training: {error:#}"), cx)
-                            }
+                    Ok(training) => match training.save_active() {
+                        Ok(()) => {
+                            this.training = training;
+                            this.success("Training profile active".to_owned(), cx);
                         }
-                    }
+                        Err(error) => this.error(format!("Could not save training: {error:#}"), cx),
+                    },
                     Err(error) => this.error(format!("Could not import training: {error:#}"), cx),
                 });
             }
@@ -1124,17 +1106,28 @@ impl Muspector {
         let bytes = self.training.export();
         cx.spawn(async move |view, cx| {
             if let Ok(Ok(Some(path))) = receiver.await {
-                let shown = path.clone();
                 let result = cx
                     .background_spawn(async move { std::fs::write(path, bytes) })
                     .await;
                 let _ = view.update(cx, |this, cx| match result {
-                    Ok(()) => this.success(format!("Training exported to {}", shown.display()), cx),
+                    Ok(()) => this.success("Training profile exported".to_owned(), cx),
                     Err(error) => this.error(format!("Could not export training: {error}"), cx),
                 });
             }
         })
         .detach();
+    }
+
+    fn restore_default_training(&mut self, cx: &mut Context<Self>) {
+        self.set_training_open(false, cx);
+        let training = blind::Training::embedded();
+        match training.save_active() {
+            Ok(()) => {
+                self.training = training;
+                self.success("Default clean restored".to_owned(), cx);
+            }
+            Err(error) => self.error(format!("Could not restore default clean: {error:#}"), cx),
+        }
     }
 
     fn set_training_open(&mut self, open: bool, cx: &mut Context<Self>) {
@@ -1809,9 +1802,8 @@ impl Muspector {
             let result = task.await;
             let _ = view.update(cx, |this, cx| match result {
                 Ok(saved) => {
-                    let shown = saved.project.clone();
                     this.apply_saved(&path, saved);
-                    this.success(format!("Saved {}", shown.display()), cx);
+                    this.success("Document saved".to_owned(), cx);
                     if let Some(index) = this.tabs.iter().position(|tab| tab.path == path) {
                         this.close_now(index, cx);
                     }
@@ -1847,9 +1839,8 @@ impl Muspector {
             let result = task.await;
             let _ = view.update(cx, |this, cx| match result {
                 Ok(saved) => {
-                    let shown = saved.project.clone();
                     this.apply_saved(&path, saved);
-                    this.success(format!("Saved {}", shown.display()), cx);
+                    this.success("Document saved".to_owned(), cx);
                 }
                 Err(error) => this.error(format!("Could not save: {error:#}"), cx),
             });
@@ -2647,13 +2638,12 @@ impl Muspector {
         };
         let target = selection_path(&logical);
         self.selection_menu = None;
-        let shown = target.clone();
         let task =
             cx.background_spawn(async move { crate::clip::export(&source, &target, start, end) });
         cx.spawn(async move |view, cx| {
             let result = task.await;
             let _ = view.update(cx, |this, cx| match result {
-                Ok(()) => this.success(format!("Exported {}", shown.display()), cx),
+                Ok(()) => this.success("Selection exported".to_owned(), cx),
                 Err(error) => this.error(format!("Could not export WAV: {error:#}"), cx),
             });
         })
@@ -2937,6 +2927,7 @@ impl Muspector {
             .justify_center()
             .child(
                 div()
+                    .w_full()
                     .max_w(px(400.0))
                     .px_4()
                     .py_3()
@@ -2960,7 +2951,13 @@ impl Muspector {
                             .justify_center()
                             .child(alert.kind.icon().draw(px(15.0), color)),
                     )
-                    .child(alert.text.clone()),
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .truncate()
+                            .child(alert.text.clone()),
+                    ),
             );
 
         Some(match alert.fade {
@@ -3884,6 +3881,31 @@ impl Muspector {
                                         .text_size(px(9.0))
                                         .text_color(theme::FAINT)
                                         .child("Restore a portable .musp-training profile"),
+                                ),
+                        ),
+                )
+                .child(
+                    div()
+                        .id("restore-default-training")
+                        .h(px(42.0))
+                        .px_3()
+                        .flex()
+                        .items_center()
+                        .cursor_pointer()
+                        .hover(|node| node.bg(theme::HOVER))
+                        .on_click(cx.listener(|this, _event, _window, cx| {
+                            this.restore_default_training(cx);
+                        }))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .child(div().text_sm().child("Restore Default Clean"))
+                                .child(
+                                    div()
+                                        .text_size(px(9.0))
+                                        .text_color(theme::FAINT)
+                                        .child("Use the bundled clean reference"),
                                 ),
                         ),
                 )
