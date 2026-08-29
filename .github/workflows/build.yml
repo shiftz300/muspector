@@ -105,13 +105,14 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $sdk = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Directory |
-            Sort-Object Name -Descending |
+          $mt = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Filter mt.exe -File -Recurse -ErrorAction SilentlyContinue |
+            Where-Object { $_.Directory.Name -eq "x64" } |
+            Sort-Object FullName -Descending |
             Select-Object -First 1
-          if (-not $sdk) { throw "Windows SDK tools were not found" }
-          $mt = Join-Path $sdk.FullName "x64\mt.exe"
+          if (-not $mt) { throw "Windows SDK mt.exe was not found" }
+          $mtPath = $mt.FullName
           $manifest = Join-Path $env:RUNNER_TEMP "muspector.manifest"
-          & $mt "-inputresource:${{ matrix.artifact }};#1" "-out:$manifest"
+          & $mtPath "-inputresource:${{ matrix.artifact }};#1" "-out:$manifest"
           if ($LASTEXITCODE -ne 0) { throw "Could not extract the embedded manifest" }
           $content = Get-Content $manifest -Raw
           if ($content -notmatch 'Microsoft\.Windows\.Common-Controls' -or
