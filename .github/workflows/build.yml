@@ -101,6 +101,24 @@ jobs:
           Get-Item "${{ matrix.artifact }}" | Format-List Name, Length
           Get-FileHash "${{ matrix.artifact }}" -Algorithm SHA256
 
+      - name: Verify Windows application manifest
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $sdk = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Directory |
+            Sort-Object Name -Descending |
+            Select-Object -First 1
+          if (-not $sdk) { throw "Windows SDK tools were not found" }
+          $mt = Join-Path $sdk.FullName "x64\mt.exe"
+          $manifest = Join-Path $env:RUNNER_TEMP "muspector.manifest"
+          & $mt "-inputresource:${{ matrix.artifact }};#1" "-out:$manifest"
+          if ($LASTEXITCODE -ne 0) { throw "Could not extract the embedded manifest" }
+          $content = Get-Content $manifest -Raw
+          if ($content -notmatch 'Microsoft\.Windows\.Common-Controls' -or
+              $content -notmatch 'version="6\.0\.0\.0"') {
+            throw "The executable does not activate Common Controls v6"
+          }
+
       - name: Upload single executable
         uses: actions/upload-artifact@v7
         with:
