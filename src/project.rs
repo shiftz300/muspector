@@ -1,13 +1,12 @@
-use crate::{
-    chain::{Chain, Kind, Param},
-    remix::{AudioQualityPolicy, ChainSpec, EffectSpec, SCHEMA_VERSION},
-};
+use crate::{chain::Chain, remix::AudioQualityPolicy};
 use anyhow::{Context, Result};
 use serde::Serialize;
 use std::{
-    fs,
+    fs::File,
+    io::{Read, Write},
     path::{Path, PathBuf},
 };
+use tempfile::{Builder, NamedTempFile};
 
 #[derive(Clone)]
 pub struct Saved {
@@ -22,7 +21,6 @@ struct Document {
     audio: String,
     confidence: f64,
     audio_quality: AudioQualityPolicy,
-    reconstruction: ChainSpec,
     effects: Vec<Effect>,
 }
 
@@ -56,34 +54,22 @@ pub fn save(
     let project = project
         .map(Path::to_owned)
         .unwrap_or_else(|| sibling(logical, "json"));
-    let audio = if audio_dirty {
-        let audio = sibling(logical, "wav");
-        fs::copy(source, &audio).with_context(|| {
-            format!(
-                "could not save edited audio from {} to {}",
-                source.display(),
-                audio.display()
-            )
-        })?;
-        audio
-    } else {
-        source.to_owned()
-    };
-    let reconstruction = reconstruction(chain);
-    reconstruction
-        .validate()
-        .context("could not encode the reconstructed effect chain")?;
     let audio_quality = AudioQualityPolicy::loss_preserving();
     audio_quality
         .validate()
         .context("could not enforce the audio-quality policy")?;
     let document = Document {
-        version: 3,
+        version: 4,
         source: logical.to_string_lossy().into_owned(),
-        audio: audio.to_string_lossy().into_owned(),
+        audio: if audio_dirty {
+            sibling(logical, "wav")
+        } else {
+            source.to_owned()
+        }
+        .to_string_lossy()
+        .into_owned(),
         confidence: chain.score,
         audio_quality,
-        reconstruction,
         effects: chain
             .effects
             .iter()
@@ -110,44 +96,71 @@ pub fn save(
             .collect(),
     };
     let bytes = serde_json::to_vec_pretty(&document).context("could not encode the project")?;
-    fs::write(&project, bytes)
+    let mut project_file = temporary_beside(&project, ".muspector-project-")?;
+    project_file
+        .write_all(&bytes)
         .with_context(|| format!("could not write project {}", project.display()))?;
+    project_file
+        .as_file()
+        .sync_all()
+        .with_context(|| format!("could not flush project {}", project.display()))?;
+
+    let audio = if audio_dirty {
+        let audio = sibling(logical, "wav");
+        let mut input = File::open(source)
+            .with_context(|| format!("could not open edited audio {}", source.display()))?;
+        let mut audio_file = temporary_beside(&audio, ".muspector-audio-")?;
+        copy(&mut input, &mut audio_file).with_context(|| {
+            format!(
+                "could not stage edited audio from {} beside {}",
+                source.display(),
+                audio.display()
+            )
+        })?;
+        audio_file
+            .as_file()
+            .sync_all()
+            .with_context(|| format!("could not flush edited audio {}", audio.display()))?;
+        persist(audio_file, &audio, "edited audio")?;
+        audio
+    } else {
+        source.to_owned()
+    };
+    persist(project_file, &project, "project")?;
     Ok(Saved { project, audio })
 }
 
-fn reconstruction(chain: &Chain) -> ChainSpec {
-    let effects = chain
-        .active()
-        .filter_map(|effect| match effect.kind {
-            Kind::Drive => Some(EffectSpec::Drive {
-                gain_db: value(&effect.params, "Gain") as f32,
-                tone: value(&effect.params, "Tone") as f32 / 100.0,
-                level_db: value(&effect.params, "Level") as f32,
-            }),
-            Kind::Delay => Some(EffectSpec::Delay {
-                time_ms: value(&effect.params, "Time") as f32,
-                feedback: value(&effect.params, "Feedback") as f32 / 100.0,
-                mix: value(&effect.params, "Mix") as f32 / 100.0,
-            }),
-            Kind::Reverb => Some(EffectSpec::Reverb {
-                decay_s: value(&effect.params, "Decay") as f32,
-                damping: value(&effect.params, "Damp") as f32 / 100.0,
-                mix: value(&effect.params, "Mix") as f32 / 100.0,
-            }),
-            _ => None,
+fn temporary_beside(target: &Path, prefix: &str) -> Result<NamedTempFile> {
+    let parent = target.parent().unwrap_or_else(|| Path::new("."));
+    Builder::new()
+        .prefix(prefix)
+        .tempfile_in(parent)
+        .with_context(|| {
+            format!(
+                "could not create a temporary file beside {}",
+                target.display()
+            )
         })
-        .collect();
-    ChainSpec {
-        schema: SCHEMA_VERSION,
-        effects,
+}
+
+fn copy(input: &mut File, output: &mut NamedTempFile) -> Result<u64> {
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut written = 0_u64;
+    loop {
+        let count = input.read(&mut buffer)?;
+        if count == 0 {
+            return Ok(written);
+        }
+        output.write_all(&buffer[..count])?;
+        written = written.saturating_add(count as u64);
     }
 }
 
-fn value(params: &[Param], name: &str) -> f64 {
-    params
-        .iter()
-        .find(|param| param.name == name)
-        .map_or(0.0, |param| param.value)
+fn persist(file: NamedTempFile, target: &Path, kind: &str) -> Result<()> {
+    file.persist(target)
+        .map(|_| ())
+        .map_err(|error| error.error)
+        .with_context(|| format!("could not replace {kind} {}", target.display()))
 }
 
 fn sibling(source: &Path, extension: &str) -> PathBuf {
@@ -162,12 +175,13 @@ fn sibling(source: &Path, extension: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     #[test]
     fn saves_project_and_edited_audio_without_overwriting_source() {
-        let id = std::process::id();
-        let logical = std::env::temp_dir().join(format!("muspector-project-{id}.mp3"));
-        let working = std::env::temp_dir().join(format!("muspector-project-{id}-working.wav"));
+        let directory = tempfile::tempdir().expect("create test directory");
+        let logical = directory.path().join("source.mp3");
+        let working = directory.path().join("working.wav");
         fs::write(&logical, b"original").expect("write logical source");
         fs::write(&working, b"edited").expect("write working audio");
         let chain = Chain {
@@ -179,15 +193,40 @@ mod tests {
         assert_eq!(fs::read(&logical).expect("read original"), b"original");
         assert_eq!(fs::read(&saved.audio).expect("read edited"), b"edited");
         let json = fs::read_to_string(&saved.project).expect("read project");
-        assert!(json.contains("\"version\": 3"));
+        assert!(json.contains("\"version\": 4"));
         assert!(json.contains("\"confidence\": 0.72"));
         assert!(json.contains("\"source_audio_immutable\": true"));
         assert!(json.contains("\"automatic_normalization\": false"));
         assert!(json.contains("\"lossy_reencoding\": false"));
-        assert!(json.contains("\"reconstruction\""));
+        assert!(!json.contains("\"reconstruction\""));
+    }
 
-        for path in [logical, working, saved.audio, saved.project] {
-            let _ = fs::remove_file(path);
-        }
+    #[test]
+    fn project_staging_failure_does_not_replace_saved_audio() {
+        let directory = tempfile::tempdir().expect("create test directory");
+        let logical = directory.path().join("source.mp3");
+        let working = directory.path().join("working.wav");
+        let saved_audio = sibling(&logical, "wav");
+        fs::write(&logical, b"original").expect("write logical source");
+        fs::write(&working, b"new edit").expect("write working audio");
+        fs::write(&saved_audio, b"previous edit").expect("write previous audio");
+        let missing_project = directory.path().join("missing/project.json");
+
+        let result = save(
+            Some(&missing_project),
+            &logical,
+            &working,
+            true,
+            &Chain {
+                effects: Vec::new(),
+                score: 0.5,
+            },
+        );
+
+        assert!(result.is_err());
+        assert_eq!(
+            fs::read(saved_audio).expect("read previous audio"),
+            b"previous edit"
+        );
     }
 }

@@ -19,8 +19,52 @@ env:
   RUST_BACKTRACE: "1"
 
 jobs:
+  quality:
+    name: Format, lint, test, and audit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      checks: write
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Install Linux libraries
+        run: >-
+          sudo apt-get update && sudo apt-get install --yes --no-install-recommends
+          libfontconfig-dev libglib2.0-dev libssl-dev libvulkan1
+          libwayland-dev libx11-xcb-dev libxkbcommon-x11-dev libasound2-dev
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@1.96.0
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache Rust builds
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: quality
+          cache-on-failure: true
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Lint
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Audit dependencies
+        uses: rustsec/audit-check@v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
   build:
     name: ${{ matrix.name }}
+    needs: quality
     strategy:
       fail-fast: false
       matrix:

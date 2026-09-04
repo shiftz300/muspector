@@ -3409,6 +3409,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "cpal",
+ "crossbeam-queue",
  "ebur128",
  "gpui",
  "gpui_platform",
@@ -3418,6 +3419,7 @@ dependencies = [
  "serde_json",
  "symphonia",
  "sysinfo 0.39.6",
+ "tempfile",
  "winresource",
 ]
 

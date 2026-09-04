@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 
 pub const SCHEMA_VERSION: u32 = 1;
 pub const AUDIO_QUALITY_SCHEMA_VERSION: u32 = 1;
+pub const MAX_MODEL_FRAMES: usize = 480_000;
+pub const MAX_RENDER_BLOCK_FRAMES: usize = 2_048;
 
 /// Interleaved audio passed across the model boundary.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -24,9 +26,10 @@ impl AudioView<'_> {
         if self.sample_rate == 0
             || self.channels == 0
             || !self.samples.len().is_multiple_of(self.channels)
+            || self.samples.len() / self.channels > MAX_MODEL_FRAMES
             || self.samples.iter().any(|sample| !sample.is_finite())
         {
-            bail!("invalid interleaved audio at the model boundary");
+            bail!("invalid or oversized interleaved audio at the model boundary");
         }
         Ok(())
     }
@@ -48,30 +51,35 @@ impl ChainEstimate {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub struct RenderedAudio {
-    pub samples: Vec<f32>,
+/// Fixed geometry negotiated before a runtime enters the audio callback.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StreamSpec {
     pub sample_rate: u32,
     pub channels: usize,
+    pub max_block_frames: usize,
 }
 
-impl RenderedAudio {
-    pub fn view(&self) -> AudioView<'_> {
-        AudioView {
-            samples: &self.samples,
-            sample_rate: self.sample_rate,
-            channels: self.channels,
+impl StreamSpec {
+    pub fn validate(self) -> Result<()> {
+        if self.sample_rate == 0
+            || self.channels == 0
+            || self.max_block_frames == 0
+            || self.max_block_frames > MAX_RENDER_BLOCK_FRAMES
+        {
+            bail!("invalid real-time stream geometry");
         }
+        Ok(())
     }
 
-    pub fn validate_for(&self, input: AudioView<'_>) -> Result<()> {
+    pub fn validate_block(self, input: AudioView<'_>, output: &[f32]) -> Result<()> {
+        self.validate()?;
         input.validate()?;
-        self.view().validate()?;
-        if self.sample_rate != input.sample_rate
-            || self.channels != input.channels
-            || self.samples.len() != input.samples.len()
+        if input.sample_rate != self.sample_rate
+            || input.channels != self.channels
+            || input.samples.len() != output.len()
+            || input.samples.len() / input.channels > self.max_block_frames
         {
-            bail!("rendered audio changed frame count, channels, or sample rate");
+            bail!("audio block does not match the configured stream");
         }
         Ok(())
     }
@@ -81,10 +89,21 @@ impl RenderedAudio {
 ///
 /// A local adapter should implement this trait for the dependency's runtime so
 /// neither repository needs to know about GPUI or the other's internal types.
+/// `configure` and `update_chain` run away from the audio callback. Once
+/// configured, `process_block` must not allocate, lock, perform I/O, or change
+/// the interleaved audio geometry; it writes into the caller-owned output.
 pub trait ModelRuntime: Send {
-    fn infer_chain(&mut self, audio: AudioView<'_>) -> Result<Option<ChainEstimate>>;
+    fn infer_segment(&mut self, audio: AudioView<'_>) -> Result<Option<ChainEstimate>>;
 
-    fn render_chain(&mut self, audio: AudioView<'_>, chain: &ChainSpec) -> Result<RenderedAudio>;
+    fn configure(&mut self, stream: StreamSpec) -> Result<()>;
+
+    fn update_chain(&mut self, chain: &ChainSpec, smoothing_frames: usize) -> Result<()>;
+
+    fn process_block(&mut self, input: AudioView<'_>, output: &mut [f32]) -> Result<()>;
+
+    fn latency_frames(&self) -> usize;
+
+    fn reset(&mut self);
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -283,7 +302,7 @@ mod tests {
     }
 
     #[test]
-    fn model_boundary_rejects_invalid_or_reshaped_audio() {
+    fn model_boundary_rejects_invalid_or_oversized_audio() {
         let input = AudioView {
             samples: &[0.25, -0.25, 0.5, -0.5],
             sample_rate: 48_000,
@@ -291,24 +310,48 @@ mod tests {
         };
         input.validate().expect("valid stereo audio");
 
-        let valid = RenderedAudio {
-            samples: input.samples.to_vec(),
-            sample_rate: input.sample_rate,
-            channels: input.channels,
-        };
-        valid.validate_for(input).expect("preserved audio geometry");
-
-        let reshaped = RenderedAudio {
-            channels: 1,
-            ..valid
-        };
-        assert!(reshaped.validate_for(input).is_err());
-
         let invalid = AudioView {
             samples: &[f32::NAN],
             sample_rate: 48_000,
             channels: 1,
         };
         assert!(invalid.validate().is_err());
+
+        let oversized = vec![0.0; MAX_MODEL_FRAMES + 1];
+        assert!(
+            AudioView {
+                samples: &oversized,
+                sample_rate: 48_000,
+                channels: 1,
+            }
+            .validate()
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn real_time_blocks_use_preallocated_matching_output() {
+        let stream = StreamSpec {
+            sample_rate: 48_000,
+            channels: 2,
+            max_block_frames: 256,
+        };
+        let input = AudioView {
+            samples: &[0.25, -0.25, 0.5, -0.5],
+            sample_rate: 48_000,
+            channels: 2,
+        };
+        stream
+            .validate_block(input, &[0.0; 4])
+            .expect("matching caller-owned output");
+        assert!(stream.validate_block(input, &[0.0; 2]).is_err());
+        assert!(
+            StreamSpec {
+                max_block_frames: MAX_RENDER_BLOCK_FRAMES + 1,
+                ..stream
+            }
+            .validate()
+            .is_err()
+        );
     }
 }

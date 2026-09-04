@@ -96,25 +96,31 @@ impl Report {
     }
 }
 
-pub fn inspect(path: &Path) -> Result<Report> {
-    inspect_span(path, None, |_| {})
+pub fn inspect_cancellable(
+    path: &Path,
+    progress: impl FnMut(Progress),
+    cancelled: impl FnMut() -> bool,
+) -> Result<Report> {
+    inspect_span(path, None, progress, cancelled)
 }
 
-pub fn inspect_with_progress(path: &Path, progress: impl FnMut(Progress)) -> Result<Report> {
-    inspect_span(path, None, progress)
-}
-
-pub fn inspect_range(path: &Path, start: f64, end: f64) -> Result<Report> {
+pub fn inspect_range_cancellable(
+    path: &Path,
+    start: f64,
+    end: f64,
+    cancelled: impl FnMut() -> bool,
+) -> Result<Report> {
     if !start.is_finite() || !end.is_finite() || start < 0.0 || end <= start {
         bail!("Invalid analysis range");
     }
-    inspect_span(path, Some((start, end)), |_| {})
+    inspect_span(path, Some((start, end)), |_| {}, cancelled)
 }
 
 fn inspect_span(
     path: &Path,
     span: Option<(f64, f64)>,
     mut progress: impl FnMut(Progress),
+    mut cancelled: impl FnMut() -> bool,
 ) -> Result<Report> {
     progress(Progress {
         value: 0.02,
@@ -182,6 +188,9 @@ fn inspect_span(
     });
 
     'packets: loop {
+        if cancelled() {
+            bail!("analysis cancelled");
+        }
         let packet = match format.next_packet() {
             Ok(packet) => packet,
             Err(Error::IoError(error)) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
@@ -231,6 +240,9 @@ fn inspect_span(
             .saturating_sub(packet_start)
             .min(packet_frames as u64) as usize;
         let selected = &samples[local_start * channels..local_end * channels];
+        if selected.iter().any(|sample| !sample.is_finite()) {
+            bail!("audio contains non-finite samples");
+        }
         loudness.add_frames_f32(selected).context("响度分析失败")?;
         let momentary = loudness
             .loudness_momentary()
@@ -259,6 +271,9 @@ fn inspect_span(
 
     if count == 0 || frames == 0 {
         bail!("音轨没有可分析的采样");
+    }
+    if cancelled() {
+        bail!("analysis cancelled");
     }
 
     progress(Progress {
@@ -851,9 +866,10 @@ mod tests {
         }
         drop(file);
 
+        assert!(inspect_cancellable(&path, |_| {}, || true).is_err());
         let mut progress = Vec::new();
-        let report = inspect_with_progress(&path, |update| progress.push(update)).unwrap();
-        let range = inspect_range(&path, 0.02, 0.05).unwrap();
+        let report = inspect_cancellable(&path, |update| progress.push(update), || false).unwrap();
+        let range = inspect_range_cancellable(&path, 0.02, 0.05, || false).unwrap();
         std::fs::remove_file(path).unwrap();
         assert_eq!(report.codec, "PCM");
         assert_eq!(report.rate, rate);

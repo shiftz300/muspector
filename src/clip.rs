@@ -3,7 +3,7 @@ use std::{
     fs::File,
     io::{Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::Arc,
 };
 use symphonia::core::{
     audio::SampleBuffer,
@@ -14,8 +14,12 @@ use symphonia::core::{
     meta::MetadataOptions,
     probe::Hint,
 };
+use tempfile::{Builder, TempPath};
 
-static NEXT: AtomicU64 = AtomicU64::new(1);
+#[derive(Clone)]
+pub struct TemporaryAudio {
+    _path: Arc<TempPath>,
+}
 
 #[derive(Clone)]
 pub struct Clip {
@@ -23,6 +27,7 @@ pub struct Clip {
     pub rate: u32,
     pub channels: usize,
     pub frames: u64,
+    _owner: TemporaryAudio,
 }
 
 impl Clip {
@@ -33,6 +38,7 @@ impl Clip {
 
 pub struct Edit {
     pub path: PathBuf,
+    pub(crate) owner: TemporaryAudio,
 }
 
 struct Source {
@@ -124,12 +130,10 @@ struct Wav {
 }
 
 impl Wav {
-    fn create(path: &Path, rate: u32, channels: usize) -> Result<Self> {
+    fn new(mut file: File, rate: u32, channels: usize) -> Result<Self> {
         if channels == 0 || channels > u16::MAX as usize {
             bail!("unsupported channel count");
         }
-        let mut file = File::create(path)
-            .with_context(|| format!("could not create WAV {}", path.display()))?;
         file.write_all(&[0; 44])?;
         Ok(Self {
             file,
@@ -165,7 +169,12 @@ impl Wav {
             .context("invalid WAV byte rate")?;
         self.file.seek(SeekFrom::Start(0))?;
         self.file.write_all(b"RIFF")?;
-        self.file.write_all(&(36_u32 + data).to_le_bytes())?;
+        self.file.write_all(
+            &36_u32
+                .checked_add(data)
+                .context("WAV exceeds the RIFF size limit")?
+                .to_le_bytes(),
+        )?;
         self.file.write_all(b"WAVEfmt ")?;
         self.file.write_all(&16_u32.to_le_bytes())?;
         self.file.write_all(&3_u16.to_le_bytes())?;
@@ -181,35 +190,35 @@ impl Wav {
     }
 }
 
-fn temporary() -> PathBuf {
-    let id = NEXT.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!("muspector-{}-{id}.wav", std::process::id()))
-}
-
-pub fn cleanup(path: &Path) {
-    let prefix = format!("muspector-{}-", std::process::id());
-    let temporary = path.parent() == Some(std::env::temp_dir().as_path())
-        && path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name.starts_with(&prefix) && name.ends_with(".wav"));
-    if temporary {
-        let _ = std::fs::remove_file(path);
-    }
+fn temporary() -> Result<(PathBuf, TemporaryAudio, File)> {
+    let named = Builder::new()
+        .prefix("muspector-")
+        .suffix(".wav")
+        .tempfile()
+        .context("could not create a temporary audio file")?;
+    let (file, path) = named.into_parts();
+    let location = path.to_path_buf();
+    Ok((
+        location,
+        TemporaryAudio {
+            _path: Arc::new(path),
+        },
+        file,
+    ))
 }
 
 fn frame(time: f64, rate: u32) -> u64 {
     (time.max(0.0) * f64::from(rate)).round() as u64
 }
 
-fn write_range(source: &Path, target: &Path, start: f64, end: f64) -> Result<Clip> {
+fn write_range(source: &Path, file: File, start: f64, end: f64) -> Result<(u32, usize, u64)> {
     let mut source = Source::open(source)?;
     let from = frame(start, source.rate);
     let to = frame(end, source.rate).max(from);
     if to <= from {
         bail!("select a non-empty audio range");
     }
-    let mut writer = Wav::create(target, source.rate, source.channels)?;
+    let mut writer = Wav::new(file, source.rate, source.channels)?;
     let mut position = 0_u64;
     while let Some(samples) = source.next()? {
         let count = samples.len() / source.channels;
@@ -233,12 +242,7 @@ fn write_range(source: &Path, target: &Path, start: f64, end: f64) -> Result<Cli
     if frames == 0 {
         bail!("selected range contains no decodable audio");
     }
-    Ok(Clip {
-        path: target.to_owned(),
-        rate,
-        channels,
-        frames,
-    })
+    Ok((rate, channels, frames))
 }
 
 fn append(writer: &mut Wav, path: &Path, rate: u32, channels: usize) -> Result<()> {
@@ -261,8 +265,8 @@ fn rewrite(source_path: &Path, start: f64, end: f64, insert: Option<&Clip>) -> R
     }
     let from = frame(start, source.rate);
     let to = frame(end, source.rate).max(from);
-    let target = temporary();
-    let mut writer = Wav::create(&target, source.rate, source.channels)?;
+    let (target, owner, file) = temporary()?;
+    let mut writer = Wav::new(file, source.rate, source.channels)?;
     let mut position = 0_u64;
     let mut inserted = false;
     while let Some(samples) = source.next()? {
@@ -291,16 +295,36 @@ fn rewrite(source_path: &Path, start: f64, end: f64, insert: Option<&Clip>) -> R
     if frames == 0 {
         bail!("an audio document cannot be empty");
     }
-    Ok(Edit { path: target })
+    Ok(Edit {
+        path: target,
+        owner,
+    })
 }
 
 pub fn copy(source: &Path, start: f64, end: f64) -> Result<Clip> {
-    let target = temporary();
-    write_range(source, &target, start, end)
+    let (path, owner, file) = temporary()?;
+    let (rate, channels, frames) = write_range(source, file, start, end)?;
+    Ok(Clip {
+        path,
+        rate,
+        channels,
+        frames,
+        _owner: owner,
+    })
 }
 
 pub fn export(source: &Path, target: &Path, start: f64, end: f64) -> Result<()> {
-    write_range(source, target, start, end).map(|_| ())
+    let parent = target.parent().unwrap_or_else(|| Path::new("."));
+    let named = Builder::new()
+        .prefix(".muspector-export-")
+        .suffix(".wav")
+        .tempfile_in(parent)
+        .with_context(|| format!("could not create an export beside {}", target.display()))?;
+    let (file, path) = named.into_parts();
+    write_range(source, file, start, end)?;
+    path.persist_noclobber(target)
+        .map_err(|error| error.error)
+        .with_context(|| format!("could not create export {}", target.display()))
 }
 
 pub fn delete(source: &Path, start: f64, end: f64) -> Result<Edit> {
@@ -336,8 +360,8 @@ mod tests {
 
     #[test]
     fn range_edits_preserve_frame_boundaries() {
-        let source = temporary();
-        let mut writer = Wav::create(&source, 1_000, 1).expect("create source");
+        let (source, _source_owner, file) = temporary().expect("create source");
+        let mut writer = Wav::new(file, 1_000, 1).expect("create source");
         writer
             .write(
                 &(0..1_000)
@@ -356,17 +380,13 @@ mod tests {
 
         let pasted = paste(&source, &copied, 0.5, 0.5).expect("paste range");
         assert_eq!(frames(&pasted.path), 1_200);
-
-        for path in [source, copied.path, deleted.path, pasted.path] {
-            let _ = std::fs::remove_file(path);
-        }
     }
 
     #[test]
     fn float_edits_preserve_samples_without_normalizing_or_clipping() {
-        let source = temporary();
+        let (source, _source_owner, file) = temporary().expect("create source");
         let original = [-1.25_f32, -0.5, 0.0, 0.5, 1.25];
-        let mut writer = Wav::create(&source, 48_000, 1).expect("create source");
+        let mut writer = Wav::new(file, 48_000, 1).expect("create source");
         writer.write(&original).expect("write source");
         writer.finish().expect("finish source");
         let source_bytes = std::fs::read(&source).expect("snapshot source");
@@ -376,12 +396,24 @@ mod tests {
         assert_eq!(samples(&copied.path), original);
         assert_eq!(std::fs::read(&source).expect("reread source"), source_bytes);
 
-        let invalid = temporary();
-        let mut invalid_writer = Wav::create(&invalid, 48_000, 1).expect("create invalid WAV");
+        let (_invalid, _invalid_owner, file) = temporary().expect("create invalid WAV");
+        let mut invalid_writer = Wav::new(file, 48_000, 1).expect("create invalid WAV");
         assert!(invalid_writer.write(&[f32::NAN]).is_err());
+    }
 
-        for path in [source, copied.path, invalid] {
-            let _ = std::fs::remove_file(path);
-        }
+    #[test]
+    fn temporary_audio_lives_until_the_last_owner_is_dropped() {
+        let (source, _source_owner, file) = temporary().expect("create source");
+        let mut writer = Wav::new(file, 48_000, 1).expect("create source");
+        writer.write(&[0.0, 0.25, -0.25]).expect("write source");
+        writer.finish().expect("finish source");
+
+        let clip = copy(&source, 0.0, 3.0 / 48_000.0).expect("copy source");
+        let path = clip.path.clone();
+        let retained = clip.clone();
+        drop(clip);
+        assert!(path.exists());
+        drop(retained);
+        assert!(!path.exists());
     }
 }

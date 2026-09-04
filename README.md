@@ -13,13 +13,20 @@ separate `muspector-models` project.
 - Local WAV, AIFF, FLAC, MP3, AAC, ALAC, Ogg, and Vorbis decoding
 - Waveform, RMS, LUFS, spectrum, peak, crest, and frequency statistics
 - Editable Gate, Compressor, Drive, EQ, Delay, and Reverb chain
-- Multiple foreground and background inspections with smooth progress
-- Selection, playback, history, lossless working edits, and project saves
-- Native output-device selection through CoreAudio, WASAPI, or Linux CPAL hosts
+- Smooth foreground and background inspections, limited to two concurrent jobs
+- Selection, sample-accurate loop playback, history, lossless working edits, and project saves
+- Persistent native output streams through CoreAudio, WASAPI, or Linux CPAL hosts
+- User-selectable adaptive Auto (~10 ms), 128, 256, 512, 1,024, or 2,048-frame buffers
 
 The Model and Settings buttons in the upper-right toggle their floating panels.
 Click the active button again, another panel button, or anywhere outside a panel
 to close it.
+
+Playback keeps the selected output stream open between files. Decode and format
+conversion run on a background worker that feeds a bounded lock-free queue; the
+audio callback only drains prepared frames. Seeks and loop changes invalidate
+queued frames, and loop boundaries are tracked in output frames rather than by
+the UI refresh timer.
 
 ## Requirements
 
@@ -55,6 +62,9 @@ cargo clippy --all-targets --locked -- -D warnings
 cargo test --locked
 ```
 
+CI runs the same format, lint, test, and dependency-audit gates before starting
+the platform build matrix.
+
 Pushes to `main` build optimized Linux x86-64, Windows x86-64, and macOS arm64
 executables. A successful matrix replaces the assets and force-moves the
 rolling `latest` tag and release to that commit.
@@ -63,8 +73,12 @@ rolling `latest` tag and release to that commit.
 
 Muspector owns only the model-neutral contract in `src/remix.rs`. It defines
 named physical controls, interleaved audio geometry, confidence, a
-loss-preserving render policy, and the single `ModelRuntime` inference/render
-trait.
+loss-preserving render policy, and a single `ModelRuntime` trait. Its
+`infer_segment` call accepts at most 480,000 frames. Real-time rendering is
+negotiated once with `configure`, receives chain updates with an explicit
+smoothing interval, and processes at most 2,048 frames into caller-owned output
+buffers. The runtime also reports latency and resets state after transport
+discontinuities; `process_block` may not allocate, lock, or perform I/O.
 
 Training, evaluation, weights, downloads, manifests, model-store logic, and
 package publication belong in the separate `muspector-models` repository. A
@@ -84,7 +98,7 @@ intended use before loading.
 - `audio`: playback, device discovery, and output routing
 - `chain`: editable effect-chain types and heuristic proposal
 - `clip`: selection copy, delete, paste, and float-WAV export
-- `project`: project metadata and edited-audio save coordination
+- `project`: version-4 project metadata and atomic save coordination
 - `remix`: model-neutral inference and rendering contract
 - `assets`: embedded interface resources
 - `theme`: visual tokens

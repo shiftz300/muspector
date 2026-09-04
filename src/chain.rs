@@ -104,12 +104,6 @@ pub struct Chain {
     pub score: f64,
 }
 
-impl Chain {
-    pub fn active(&self) -> impl Iterator<Item = &Effect> {
-        self.effects.iter().filter(|effect| effect.active)
-    }
-}
-
 #[derive(Clone, Copy, Debug)]
 pub struct Fingerprint {
     pub peak: f64,
