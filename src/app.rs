@@ -821,6 +821,7 @@ pub struct Muspector {
     floating_menu: Option<FloatingMenu>,
     visible_menu: Option<FloatingMenu>,
     menu_motion: usize,
+    saving: bool,
     closing_app: bool,
 }
 
@@ -897,6 +898,7 @@ impl Muspector {
             floating_menu: None,
             visible_menu: None,
             menu_motion: 0,
+            saving: false,
             closing_app: false,
         };
         if let Some(path) = std::env::args_os().nth(1) {
@@ -1545,6 +1547,7 @@ impl Muspector {
         };
         if !self.history.record(label.into(), snapshot, merge) {
             self.dirty = self.history.dirty();
+            self.sync_active();
             return;
         }
         if let Some(cancelled) = self.document_cancelled.take() {
@@ -1793,6 +1796,16 @@ impl Muspector {
         self.baseline = None;
         self.history = History::default();
         self.clipboard = None;
+        self.saving = false;
+    }
+
+    fn begin_save(&mut self, cx: &mut Context<Self>) -> bool {
+        if !claim_save(&mut self.saving) {
+            self.warn("A save is already in progress".to_owned(), cx);
+            false
+        } else {
+            true
+        }
     }
 
     fn save_and_close(&mut self, path: PathBuf, cx: &mut Context<Self>) {
@@ -1800,6 +1813,9 @@ impl Muspector {
         let Some(data) = self.save_data(&path) else {
             return;
         };
+        if !self.begin_save(cx) {
+            return;
+        }
         let task = cx.background_spawn(async move {
             let result = crate::project::save(
                 data.project.as_deref(),
@@ -1812,24 +1828,27 @@ impl Muspector {
         });
         cx.spawn(async move |view, cx| {
             let (data, result) = task.await;
-            let _ = view.update(cx, |this, cx| match result {
-                Ok(saved) => {
-                    let current = this.apply_saved(&data, saved);
-                    if current {
-                        this.success("Document saved".to_owned(), cx);
-                    } else {
-                        this.warn(
-                            "Saved an earlier version; newer edits remain unsaved".to_owned(),
-                            cx,
-                        );
+            let _ = view.update(cx, |this, cx| {
+                this.saving = false;
+                match result {
+                    Ok(saved) => {
+                        let current = this.apply_saved(&data, saved);
+                        if current {
+                            this.success("Document saved".to_owned(), cx);
+                        } else {
+                            this.warn(
+                                "Saved an earlier version; newer edits remain unsaved".to_owned(),
+                                cx,
+                            );
+                        }
+                        if current
+                            && let Some(index) = this.tabs.iter().position(|tab| tab.path == path)
+                        {
+                            this.close_now(index, cx);
+                        }
                     }
-                    if current
-                        && let Some(index) = this.tabs.iter().position(|tab| tab.path == path)
-                    {
-                        this.close_now(index, cx);
-                    }
+                    Err(error) => this.error(format!("Could not save: {error:#}"), cx),
                 }
-                Err(error) => this.error(format!("Could not save: {error:#}"), cx),
             });
         })
         .detach();
@@ -1847,6 +1866,9 @@ impl Muspector {
         let Some(data) = self.save_data(&path) else {
             return;
         };
+        if !self.begin_save(cx) {
+            return;
+        }
         let task = cx.background_spawn(async move {
             let result = crate::project::save(
                 data.project.as_deref(),
@@ -1859,18 +1881,21 @@ impl Muspector {
         });
         cx.spawn(async move |view, cx| {
             let (data, result) = task.await;
-            let _ = view.update(cx, |this, cx| match result {
-                Ok(saved) => {
-                    if this.apply_saved(&data, saved) {
-                        this.success("Document saved".to_owned(), cx);
-                    } else {
-                        this.warn(
-                            "Saved an earlier version; newer edits remain unsaved".to_owned(),
-                            cx,
-                        );
+            let _ = view.update(cx, |this, cx| {
+                this.saving = false;
+                match result {
+                    Ok(saved) => {
+                        if this.apply_saved(&data, saved) {
+                            this.success("Document saved".to_owned(), cx);
+                        } else {
+                            this.warn(
+                                "Saved an earlier version; newer edits remain unsaved".to_owned(),
+                                cx,
+                            );
+                        }
                     }
+                    Err(error) => this.error(format!("Could not save: {error:#}"), cx),
                 }
-                Err(error) => this.error(format!("Could not save: {error:#}"), cx),
             });
         })
         .detach();
@@ -1878,6 +1903,10 @@ impl Muspector {
 
     pub fn window_should_close(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         self.sync_active();
+        if self.saving {
+            self.warn("Wait for the current save to finish".to_owned(), cx);
+            return false;
+        }
         if !self.tabs.iter().any(|tab| tab.dirty) {
             self.cleanup();
             return true;
@@ -1906,23 +1935,32 @@ impl Muspector {
         );
         cx.spawn(async move |view, cx| match answer.await.unwrap_or(2) {
             0 => {
-                let Ok(data) = view.update(cx, |this, _cx| {
+                let Ok(data) = view.update(cx, |this, cx| {
                     this.sync_active();
-                    this.tabs
-                        .iter()
-                        .filter(|tab| tab.dirty)
-                        .map(|tab| SaveData {
-                            path: tab.path.clone(),
-                            source: tab.source.clone(),
-                            project: tab.project.clone(),
-                            audio_dirty: tab.audio_dirty,
-                            report: tab.report.clone(),
-                            _source_owner: tab.revision._working_audio.clone(),
-                            generation: tab.generation,
-                            step: tab.history.current_id().expect("dirty history has a step"),
-                        })
-                        .collect::<Vec<_>>()
+                    if !this.begin_save(cx) {
+                        this.closing_app = false;
+                        return None;
+                    }
+                    Some(
+                        this.tabs
+                            .iter()
+                            .filter(|tab| tab.dirty)
+                            .map(|tab| SaveData {
+                                path: tab.path.clone(),
+                                source: tab.source.clone(),
+                                project: tab.project.clone(),
+                                audio_dirty: tab.audio_dirty,
+                                report: tab.report.clone(),
+                                _source_owner: tab.revision._working_audio.clone(),
+                                generation: tab.generation,
+                                step: tab.history.current_id().expect("dirty history has a step"),
+                            })
+                            .collect::<Vec<_>>(),
+                    )
                 }) else {
+                    return;
+                };
+                let Some(data) = data else {
                     return;
                 };
                 let task = cx.background_spawn(async move {
@@ -1943,6 +1981,7 @@ impl Muspector {
                 let close = view
                     .update(cx, |this, cx| match result {
                         Ok(saved) => {
+                            this.saving = false;
                             let mut current = true;
                             for (data, saved) in saved {
                                 current &= this.apply_saved(&data, saved);
@@ -1960,6 +1999,7 @@ impl Muspector {
                             true
                         }
                         Err(error) => {
+                            this.saving = false;
                             this.closing_app = false;
                             this.error(format!("Could not save: {error:#}"), cx);
                             false
@@ -3732,10 +3772,10 @@ impl Muspector {
         let output_width = (output_width + 48.0).clamp(180.0, 360.0);
         let requested_buffer = self.buffer;
         let timing = audio::output_timing(self.output.as_deref());
-        let automatic_buffer = timing.map(|timing| timing.automatic_buffer);
+        let automatic_buffer = timing.and_then(|timing| timing.automatic_buffer);
         let output_rate = timing.map(|timing| timing.sample_rate);
         let automatic_label = automatic_buffer.map_or_else(
-            || "Auto (—)".to_owned(),
+            || "Auto (device default)".to_owned(),
             |frames| format!("Auto ({})", buffer_timing(frames, output_rate)),
         );
 
@@ -6785,6 +6825,10 @@ fn advance_progress(current: f32, target: f32) -> f32 {
     }
 }
 
+fn claim_save(saving: &mut bool) -> bool {
+    !std::mem::replace(saving, true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6993,6 +7037,15 @@ mod tests {
         assert!(first > 0.2 && first < 0.8);
         assert_eq!(advance_progress(first, 0.1), first);
         assert_eq!(advance_progress(0.9995, 1.0), 1.0);
+    }
+
+    #[test]
+    fn save_gate_allows_only_one_background_writer() {
+        let mut saving = false;
+        assert!(claim_save(&mut saving));
+        assert!(!claim_save(&mut saving));
+        saving = false;
+        assert!(claim_save(&mut saving));
     }
 
     #[test]

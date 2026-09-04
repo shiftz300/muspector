@@ -16,7 +16,8 @@ separate `muspector-models` project.
 - Smooth foreground and background inspections, limited to two concurrent jobs
 - Selection, sample-accurate loop playback, history, lossless working edits, and project saves
 - Persistent native output streams through CoreAudio, WASAPI, or Linux CPAL hosts
-- User-selectable adaptive Auto (~10 ms), 128, 256, 512, 1,024, or 2,048-frame buffers
+- User-selectable Auto (~10 ms when supported, otherwise device default), 128,
+  256, 512, 1,024, or 2,048-frame buffers
 
 The Model and Settings buttons in the upper-right toggle their floating panels.
 Click the active button again, another panel button, or anywhere outside a panel
@@ -72,8 +73,8 @@ rolling `latest` tag and release to that commit.
 ## Model boundary
 
 Muspector owns only the model-neutral contract in `src/remix.rs`. It defines
-named physical controls, interleaved audio geometry, confidence, a
-loss-preserving render policy, and a single `ModelRuntime` trait. Its
+named physical controls, interleaved audio geometry, confidence, and a single
+`ModelRuntime` trait. Its
 `infer_segment` call accepts at most 480,000 frames. Real-time rendering is
 negotiated once with `configure`, receives chain updates with an explicit
 smoothing interval, and processes at most 2,048 frames into caller-owned output

@@ -9,7 +9,6 @@ use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
 pub const SCHEMA_VERSION: u32 = 1;
-pub const AUDIO_QUALITY_SCHEMA_VERSION: u32 = 1;
 pub const MAX_MODEL_FRAMES: usize = 480_000;
 pub const MAX_RENDER_BLOCK_FRAMES: usize = 2_048;
 
@@ -104,59 +103,6 @@ pub trait ModelRuntime: Send {
     fn latency_frames(&self) -> usize;
 
     fn reset(&mut self);
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct AudioQualityPolicy {
-    pub schema: u32,
-    pub source_audio_immutable: bool,
-    pub analysis_copy_may_downmix_or_resample: bool,
-    pub render_preserves_frames: bool,
-    pub render_preserves_channels: bool,
-    pub render_preserves_sample_rate: bool,
-    pub processing_sample_format: String,
-    pub automatic_normalization: bool,
-    pub automatic_limiting: bool,
-    pub automatic_dither: bool,
-    pub lossy_reencoding: bool,
-    pub bypass_max_absolute_error: f32,
-}
-
-impl AudioQualityPolicy {
-    pub fn loss_preserving() -> Self {
-        Self {
-            schema: AUDIO_QUALITY_SCHEMA_VERSION,
-            source_audio_immutable: true,
-            analysis_copy_may_downmix_or_resample: true,
-            render_preserves_frames: true,
-            render_preserves_channels: true,
-            render_preserves_sample_rate: true,
-            processing_sample_format: "float32".to_owned(),
-            automatic_normalization: false,
-            automatic_limiting: false,
-            automatic_dither: false,
-            lossy_reencoding: false,
-            bypass_max_absolute_error: 0.0,
-        }
-    }
-
-    pub fn validate(&self) -> Result<()> {
-        if self.schema != AUDIO_QUALITY_SCHEMA_VERSION
-            || !self.source_audio_immutable
-            || !self.render_preserves_frames
-            || !self.render_preserves_channels
-            || !self.render_preserves_sample_rate
-            || self.processing_sample_format != "float32"
-            || self.automatic_normalization
-            || self.automatic_limiting
-            || self.automatic_dither
-            || self.lossy_reencoding
-            || self.bypass_max_absolute_error != 0.0
-        {
-            bail!("project audio-quality policy is not loss-preserving");
-        }
-        Ok(())
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -288,17 +234,6 @@ mod tests {
             }],
         };
         assert!(invalid.validate().is_err());
-    }
-
-    #[test]
-    fn audio_quality_policy_forbids_hidden_processing() {
-        let policy = AudioQualityPolicy::loss_preserving();
-        policy.validate().expect("loss-preserving policy");
-        assert!(policy.source_audio_immutable);
-        assert!(!policy.automatic_normalization);
-        assert!(!policy.automatic_limiting);
-        assert!(!policy.lossy_reencoding);
-        assert_eq!(policy.bypass_max_absolute_error, 0.0);
     }
 
     #[test]

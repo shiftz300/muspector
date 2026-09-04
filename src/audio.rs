@@ -31,7 +31,7 @@ pub struct Output {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OutputTiming {
     pub sample_rate: u32,
-    pub automatic_buffer: u32,
+    pub automatic_buffer: Option<u32>,
 }
 
 const NO_SEEK: u64 = u64::MAX;
@@ -469,15 +469,19 @@ pub fn output_timing(output: Option<&str>) -> Option<OutputTiming> {
 
 fn output_timing_for_device(device: &rodio::cpal::Device) -> Option<OutputTiming> {
     let config = device.default_output_config().ok()?;
-    let target = nearest_power_of_two(config.sample_rate() / 100);
-    let automatic_buffer = match config.buffer_size() {
-        SupportedBufferSize::Range { min, max } => target.clamp(*min, *max),
-        SupportedBufferSize::Unknown => target,
-    };
+    let automatic_buffer = automatic_buffer(config.buffer_size(), config.sample_rate());
     Some(OutputTiming {
         sample_rate: config.sample_rate(),
         automatic_buffer,
     })
+}
+
+fn automatic_buffer(supported: &SupportedBufferSize, sample_rate: u32) -> Option<u32> {
+    let target = nearest_power_of_two(sample_rate / 100);
+    match supported {
+        SupportedBufferSize::Range { min, max } => Some(target.clamp(*min, *max)),
+        SupportedBufferSize::Unknown => None,
+    }
 }
 
 fn nearest_power_of_two(value: u32) -> u32 {
@@ -496,8 +500,8 @@ fn nearest_power_of_two(value: u32) -> u32 {
 fn open_device(device: rodio::cpal::Device, buffer: Option<u32>) -> Result<MixerDeviceSink> {
     let builder = DeviceSinkBuilder::from_device(device.clone())
         .context("audio output has no compatible format")?;
-    let buffer =
-        buffer.or_else(|| output_timing_for_device(&device).map(|timing| timing.automatic_buffer));
+    let buffer = buffer
+        .or_else(|| output_timing_for_device(&device).and_then(|timing| timing.automatic_buffer));
     let builder = match buffer {
         Some(frames) => builder.with_buffer_size(BufferSize::Fixed(frames)),
         None => builder,
@@ -700,5 +704,13 @@ mod tests {
         assert_eq!(nearest_power_of_two(441), 512);
         assert_eq!(nearest_power_of_two(480), 512);
         assert_eq!(nearest_power_of_two(960), 1_024);
+        assert_eq!(
+            automatic_buffer(&SupportedBufferSize::Range { min: 128, max: 256 }, 48_000),
+            Some(256)
+        );
+        assert_eq!(
+            automatic_buffer(&SupportedBufferSize::Unknown, 48_000),
+            None
+        );
     }
 }

@@ -1,4 +1,4 @@
-use crate::{chain::Chain, remix::AudioQualityPolicy};
+use crate::chain::Chain;
 use anyhow::{Context, Result};
 use serde::Serialize;
 use std::{
@@ -20,7 +20,6 @@ struct Document {
     source: String,
     audio: String,
     confidence: f64,
-    audio_quality: AudioQualityPolicy,
     effects: Vec<Effect>,
 }
 
@@ -54,10 +53,6 @@ pub fn save(
     let project = project
         .map(Path::to_owned)
         .unwrap_or_else(|| sibling(logical, "json"));
-    let audio_quality = AudioQualityPolicy::loss_preserving();
-    audio_quality
-        .validate()
-        .context("could not enforce the audio-quality policy")?;
     let document = Document {
         version: 4,
         source: logical.to_string_lossy().into_owned(),
@@ -69,7 +64,6 @@ pub fn save(
         .to_string_lossy()
         .into_owned(),
         confidence: chain.score,
-        audio_quality,
         effects: chain
             .effects
             .iter()
@@ -195,9 +189,7 @@ mod tests {
         let json = fs::read_to_string(&saved.project).expect("read project");
         assert!(json.contains("\"version\": 4"));
         assert!(json.contains("\"confidence\": 0.72"));
-        assert!(json.contains("\"source_audio_immutable\": true"));
-        assert!(json.contains("\"automatic_normalization\": false"));
-        assert!(json.contains("\"lossy_reencoding\": false"));
+        assert!(!json.contains("\"audio_quality\""));
         assert!(!json.contains("\"reconstruction\""));
     }
 
