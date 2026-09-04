@@ -4,12 +4,11 @@ mod analysis;
 mod app;
 mod assets;
 mod audio;
-mod blind;
 mod chain;
 mod clip;
 mod icon;
-mod identity;
 mod project;
+pub mod remix;
 mod theme;
 
 use app::Muspector;

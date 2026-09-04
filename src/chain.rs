@@ -102,34 +102,11 @@ impl Effect {
 pub struct Chain {
     pub effects: Vec<Effect>,
     pub score: f64,
-    pub blind: bool,
 }
 
 impl Chain {
     pub fn active(&self) -> impl Iterator<Item = &Effect> {
         self.effects.iter().filter(|effect| effect.active)
-    }
-
-    pub fn classify(&mut self, detections: impl IntoIterator<Item = (Kind, bool, f64, String)>) {
-        for (kind, active, score, evidence) in detections {
-            if let Some(slot) = self
-                .effects
-                .iter_mut()
-                .find(|candidate| candidate.kind == kind)
-            {
-                slot.active = active;
-                slot.score = score.clamp(0.0, 1.0);
-                slot.evidence = evidence;
-                slot.model = None;
-            }
-        }
-        self.blind = true;
-        let active: Vec<_> = self.active().collect();
-        self.score = if active.is_empty() {
-            0.0
-        } else {
-            active.iter().map(|effect| effect.score).sum::<f64>() / active.len() as f64
-        };
     }
 }
 
@@ -274,11 +251,7 @@ pub fn infer(f: Fingerprint) -> Chain {
     } else {
         (active.iter().map(|effect| effect.score).sum::<f64>() / active.len() as f64).min(0.78)
     };
-    Chain {
-        effects,
-        score,
-        blind: false,
-    }
+    Chain { effects, score }
 }
 
 fn scale(value: f64, low: f64, high: f64) -> f64 {
@@ -326,45 +299,5 @@ mod tests {
         assert_eq!(param.value, 0.0);
         param.set(500.0);
         assert_eq!(param.value, 100.0);
-    }
-
-    #[test]
-    fn model_classification_overrides_three_families() {
-        let mut chain = infer(Fingerprint {
-            peak: -6.0,
-            crest: 12.0,
-            range: 24.0,
-            floor: -60.0,
-            silence: 0.1,
-            transient: 0.5,
-            flatness: 0.02,
-            low: -10.0,
-            mid: -8.0,
-            high: -20.0,
-            echo: 0.1,
-            echo_ms: 250.0,
-            tail: 0.05,
-        });
-        chain.classify([
-            (Kind::Drive, true, 0.9, "pair".to_owned()),
-            (Kind::Delay, false, 0.2, "blind".to_owned()),
-            (Kind::Reverb, true, 0.8, "physics".to_owned()),
-        ]);
-        assert!(chain.blind);
-        for (kind, active, score, evidence) in [
-            (Kind::Drive, true, 0.9, "pair"),
-            (Kind::Delay, false, 0.2, "blind"),
-            (Kind::Reverb, true, 0.8, "physics"),
-        ] {
-            let effect = chain
-                .effects
-                .iter()
-                .find(|effect| effect.kind == kind)
-                .unwrap();
-            assert_eq!(effect.active, active);
-            assert_eq!(effect.score, score);
-            assert_eq!(effect.evidence, evidence);
-            assert!(effect.model.is_none());
-        }
     }
 }

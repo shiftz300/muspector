@@ -1,12 +1,10 @@
 use crate::{
     analysis::{self, Report},
     audio::{self, Audio},
-    blind,
     chain::{Chain, Effect, Param},
     icon::Icon,
     theme,
 };
-use anyhow::Context as AnyhowContext;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use gpui::PinchEvent;
 use gpui::{
@@ -30,10 +28,12 @@ const CARD: Duration = Duration::from_millis(180);
 const TAB: Duration = Duration::from_millis(170);
 const HOLD: Duration = Duration::from_millis(2800);
 const REST: Duration = Duration::from_millis(760);
+const PROGRESS_FRAME: Duration = Duration::from_millis(16);
 const OPEN: usize = 0;
 const DEVICE_CLOSED: f32 = 50.0;
 const DEVICE_OPENED: f32 = 336.0;
 const DEVICE_RAIL: f32 = 40.0;
+const EFFECT_COUNT: usize = 6;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Fade {
@@ -83,6 +83,12 @@ enum OverviewDrag {
     Pan,
     Left,
     Right,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FloatingMenu {
+    Model,
+    Settings,
 }
 
 enum State {
@@ -293,7 +299,7 @@ struct Snapshot {
     revision: Rc<Revision>,
     baseline: Chain,
     dirty: bool,
-    expanded: [bool; 6],
+    expanded: [bool; EFFECT_COUNT],
     selection: Option<(f32, f32)>,
     playhead: Option<f32>,
     looped: bool,
@@ -405,7 +411,7 @@ struct Tab {
     dirty: bool,
     audio_dirty: bool,
     revision: Rc<Revision>,
-    expanded: [bool; 6],
+    expanded: [bool; EFFECT_COUNT],
     history: History,
     motion: usize,
     shift: f32,
@@ -416,9 +422,8 @@ struct Pending {
     id: u64,
     path: PathBuf,
     progress: f32,
-    previous: f32,
+    displayed_progress: f32,
     stage: &'static str,
-    motion: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -722,11 +727,11 @@ pub struct Muspector {
     baseline: Option<Chain>,
     focus: FocusHandle,
     edit: Option<Edit>,
-    cards: [usize; 6],
-    folds: [usize; 6],
-    expanded: [bool; 6],
-    moves: [usize; 6],
-    shifts: [f32; 6],
+    cards: [usize; EFFECT_COUNT],
+    folds: [usize; EFFECT_COUNT],
+    expanded: [bool; EFFECT_COUNT],
+    moves: [usize; EFFECT_COUNT],
+    shifts: [f32; EFFECT_COUNT],
     motion: usize,
     dragging: Option<usize>,
     history: History,
@@ -740,13 +745,11 @@ pub struct Muspector {
     history_track: ScrollHandle,
     tab_track: ScrollHandle,
     tracks: [ScrollHandle; 3],
-    training: blind::Training,
-    training_open: bool,
-    training_motion: usize,
     outputs: Vec<audio::Output>,
     output: Option<String>,
-    settings_open: bool,
-    settings_motion: usize,
+    floating_menu: Option<FloatingMenu>,
+    visible_menu: Option<FloatingMenu>,
+    menu_motion: usize,
     closing_app: bool,
 }
 
@@ -793,11 +796,11 @@ impl Muspector {
             baseline: None,
             focus: cx.focus_handle(),
             edit: None,
-            cards: [0; 6],
-            folds: [0; 6],
-            expanded: [false; 6],
-            moves: [0; 6],
-            shifts: [0.0; 6],
+            cards: [0; EFFECT_COUNT],
+            folds: [0; EFFECT_COUNT],
+            expanded: [false; EFFECT_COUNT],
+            moves: [0; EFFECT_COUNT],
+            shifts: [0.0; EFFECT_COUNT],
             motion: 0,
             dragging: None,
             history: History::default(),
@@ -815,13 +818,11 @@ impl Muspector {
                 ScrollHandle::new(),
                 ScrollHandle::new(),
             ],
-            training: blind::Training::load_active(),
-            training_open: false,
-            training_motion: 0,
             outputs,
             output,
-            settings_open: false,
-            settings_motion: 0,
+            floating_menu: None,
+            visible_menu: None,
+            menu_motion: 0,
             closing_app: false,
         };
         if let Some(path) = std::env::args_os().nth(1) {
@@ -829,6 +830,19 @@ impl Muspector {
         }
         Self::monitor(cx);
         this
+    }
+
+    fn clear_effect_motion(&mut self) {
+        self.cards = [0; EFFECT_COUNT];
+        self.folds = [0; EFFECT_COUNT];
+        self.moves = [0; EFFECT_COUNT];
+        self.shifts = [0.0; EFFECT_COUNT];
+        self.dragging = None;
+    }
+
+    fn reset_effect_ui(&mut self) {
+        self.clear_effect_motion();
+        self.expanded = [false; EFFECT_COUNT];
     }
 
     fn monitor(cx: &mut Context<Self>) {
@@ -1036,150 +1050,43 @@ impl Muspector {
         .detach();
     }
 
-    fn import_clean(&mut self, cx: &mut Context<Self>) {
-        self.set_training_open(false, cx);
-        let receiver = cx.prompt_for_paths(PathPromptOptions {
-            files: true,
-            directories: false,
-            multiple: false,
-            prompt: Some("Import Clean".into()),
-        });
-        cx.spawn(async move |view, cx| {
-            if let Ok(Ok(Some(paths))) = receiver.await
-                && let Some(path) = paths.into_iter().next()
-            {
-                let task = cx.background_spawn(async move { analysis::training_from_clean(&path) });
-                let result = task.await;
-                let _ = view.update(cx, |this, cx| match result {
-                    Ok(training) => match training.save_active() {
-                        Ok(()) => {
-                            this.training = training;
-                            this.success("Clean reference active".to_owned(), cx);
-                        }
-                        Err(error) => this.error(format!("Could not save training: {error:#}"), cx),
-                    },
-                    Err(error) => this.error(format!("Could not import clean: {error:#}"), cx),
-                });
-            }
-        })
-        .detach();
-    }
-
-    fn import_training(&mut self, cx: &mut Context<Self>) {
-        self.set_training_open(false, cx);
-        let receiver = cx.prompt_for_paths(PathPromptOptions {
-            files: true,
-            directories: false,
-            multiple: false,
-            prompt: Some("Import Training".into()),
-        });
-        cx.spawn(async move |view, cx| {
-            if let Ok(Ok(Some(paths))) = receiver.await
-                && let Some(path) = paths.into_iter().next()
-            {
-                let task = cx.background_spawn(async move {
-                    let bytes = std::fs::read(&path)
-                        .map_err(anyhow::Error::from)
-                        .with_context(|| format!("could not read {}", path.display()))?;
-                    blind::Training::import(&bytes)
-                });
-                let result = task.await;
-                let _ = view.update(cx, |this, cx| match result {
-                    Ok(training) => match training.save_active() {
-                        Ok(()) => {
-                            this.training = training;
-                            this.success("Training profile active".to_owned(), cx);
-                        }
-                        Err(error) => this.error(format!("Could not save training: {error:#}"), cx),
-                    },
-                    Err(error) => this.error(format!("Could not import training: {error:#}"), cx),
-                });
-            }
-        })
-        .detach();
-    }
-
-    fn export_training(&mut self, cx: &mut Context<Self>) {
-        self.set_training_open(false, cx);
-        let receiver =
-            cx.prompt_for_new_path(Path::new("."), Some("muspector-profile.musp-training"));
-        let bytes = self.training.export();
-        cx.spawn(async move |view, cx| {
-            if let Ok(Ok(Some(path))) = receiver.await {
-                let result = cx
-                    .background_spawn(async move { std::fs::write(path, bytes) })
-                    .await;
-                let _ = view.update(cx, |this, cx| match result {
-                    Ok(()) => this.success("Training profile exported".to_owned(), cx),
-                    Err(error) => this.error(format!("Could not export training: {error}"), cx),
-                });
-            }
-        })
-        .detach();
-    }
-
-    fn restore_default_training(&mut self, cx: &mut Context<Self>) {
-        self.set_training_open(false, cx);
-        let training = blind::Training::embedded();
-        match training.save_active() {
-            Ok(()) => {
-                self.training = training;
-                self.success("Default clean restored".to_owned(), cx);
-            }
-            Err(error) => self.error(format!("Could not restore default clean: {error:#}"), cx),
-        }
-    }
-
-    fn set_training_open(&mut self, open: bool, cx: &mut Context<Self>) {
-        if self.training_open == open {
+    fn set_floating_menu(&mut self, menu: Option<FloatingMenu>, cx: &mut Context<Self>) {
+        if self.floating_menu == menu {
             return;
         }
-        self.training_open = open;
-        if open {
-            self.settings_open = false;
-        }
-        self.training_motion = self.training_motion.wrapping_add(1).max(1);
-        let motion = self.training_motion;
-        cx.notify();
-        cx.spawn(async move |view, cx| {
-            cx.background_executor().timer(TINT).await;
-            let _ = view.update(cx, |this, cx| {
-                if this.training_motion == motion {
-                    this.training_motion = 0;
-                    cx.notify();
-                }
-            });
-        })
-        .detach();
-    }
-
-    fn set_settings_open(&mut self, open: bool, cx: &mut Context<Self>) {
-        if self.settings_open == open {
-            return;
-        }
-        if open {
+        if menu == Some(FloatingMenu::Settings) {
             self.outputs = audio::outputs();
-            self.training_open = false;
         }
-        self.settings_open = open;
-        self.settings_motion = self.settings_motion.wrapping_add(1).max(1);
-        let motion = self.settings_motion;
+        self.floating_menu = menu;
+        if menu.is_some() {
+            self.visible_menu = menu;
+        }
+        self.menu_motion = self.menu_motion.wrapping_add(1).max(1);
+        let motion = self.menu_motion;
         cx.notify();
         cx.spawn(async move |view, cx| {
             cx.background_executor().timer(TINT).await;
             let _ = view.update(cx, |this, cx| {
-                if this.settings_motion == motion {
-                    this.settings_motion = 0;
+                if this.menu_motion == motion {
+                    if this.floating_menu.is_none() {
+                        this.visible_menu = None;
+                    }
+                    this.menu_motion = 0;
                     cx.notify();
                 }
             });
         })
         .detach();
+    }
+
+    fn toggle_floating_menu(&mut self, menu: FloatingMenu, cx: &mut Context<Self>) {
+        let next = (self.floating_menu != Some(menu)).then_some(menu);
+        self.set_floating_menu(next, cx);
     }
 
     fn select_output(&mut self, output: Option<String>, cx: &mut Context<Self>) {
         if self.output == output {
-            self.set_settings_open(false, cx);
+            self.set_floating_menu(None, cx);
             return;
         }
         if let Err(error) = audio::save_output(output.as_deref()) {
@@ -1189,7 +1096,7 @@ impl Muspector {
         self.output = output;
         self.audio = None;
         self.playback = self.playback.wrapping_add(1);
-        self.set_settings_open(false, cx);
+        self.set_floating_menu(None, cx);
         self.success("Audio output updated".to_owned(), cx);
     }
 
@@ -1209,12 +1116,7 @@ impl Muspector {
         self.overview = None;
         self.overview_anchor = 0.0;
         self.edit = None;
-        self.cards = [0; 6];
-        self.folds = [0; 6];
-        self.expanded = [false; 6];
-        self.moves = [0; 6];
-        self.shifts = [0.0; 6];
-        self.dragging = None;
+        self.reset_effect_ui();
         *self.inspector_drag.borrow_mut() = None;
         self.rail = Hover::Idle;
         self.rail_motion = 0;
@@ -1573,11 +1475,7 @@ impl Muspector {
         self.playhead = step.snapshot.playhead;
         self.looped = step.snapshot.looped && self.selection.is_some();
         self.edit = None;
-        self.cards = [0; 6];
-        self.folds = [0; 6];
-        self.moves = [0; 6];
-        self.shifts = [0.0; 6];
-        self.dragging = None;
+        self.clear_effect_motion();
         if let Some(index) = self.active
             && let Some(tab) = self.tabs.get_mut(index)
         {
@@ -2036,9 +1934,8 @@ impl Muspector {
             id: job,
             path: path.clone(),
             progress: 0.0,
-            previous: 0.0,
+            displayed_progress: 0.0,
             stage: "Queued",
-            motion: 0,
         });
         let foreground = self.active.is_none() && self.pending_active.is_none();
         if foreground {
@@ -2049,18 +1946,15 @@ impl Muspector {
         }
         cx.notify();
 
-        let training = self.training.clone();
         let (progress_tx, progress_rx) = std::sync::mpsc::channel();
         let task = cx.background_spawn(async move {
-            analysis::inspect_with_progress(&path, training, |progress| {
+            analysis::inspect_with_progress(&path, |progress| {
                 let _ = progress_tx.send(progress);
             })
         });
         cx.spawn(async move |view, cx| {
             loop {
-                cx.background_executor()
-                    .timer(Duration::from_millis(33))
-                    .await;
+                cx.background_executor().timer(PROGRESS_FRAME).await;
                 let mut latest = None;
                 let mut disconnected = false;
                 loop {
@@ -2080,11 +1974,19 @@ impl Muspector {
                         else {
                             return false;
                         };
+                        let mut changed = false;
                         if let Some(progress) = latest {
-                            pending.previous = pending.progress;
-                            pending.progress = progress.value.clamp(0.0, 1.0);
+                            pending.progress = pending.progress.max(progress.value.clamp(0.0, 1.0));
                             pending.stage = progress.stage;
-                            pending.motion = pending.motion.wrapping_add(1).max(1);
+                            changed = true;
+                        }
+                        let displayed =
+                            advance_progress(pending.displayed_progress, pending.progress);
+                        if displayed != pending.displayed_progress {
+                            pending.displayed_progress = displayed;
+                            changed = true;
+                        }
+                        if changed {
                             cx.notify();
                         }
                         true
@@ -2109,7 +2011,7 @@ impl Muspector {
                     Ok(report) => {
                         let report = Box::new(report);
                         let baseline = report.chain.clone();
-                        let expanded_state = [false; 6];
+                        let expanded_state = [false; EFFECT_COUNT];
                         let revision = Rc::new(Revision {
                             report: report.clone(),
                             source: report.path.clone(),
@@ -2267,12 +2169,7 @@ impl Muspector {
             let audio_dirty = self.audio_dirty;
             report.chain = baseline.clone();
             self.edit = None;
-            self.cards = [0; 6];
-            self.folds = [0; 6];
-            self.expanded = [false; 6];
-            self.moves = [0; 6];
-            self.shifts = [0.0; 6];
-            self.dragging = None;
+            self.reset_effect_ui();
             self.dirty = audio_dirty;
             if let Some(index) = self.active
                 && let Some(tab) = self.tabs.get_mut(index)
@@ -2371,10 +2268,7 @@ impl Muspector {
         self.job = self.job.wrapping_add(1);
         let job = self.job;
 
-        let training = self.training.clone();
-        let task = cx.background_spawn(async move {
-            analysis::inspect_range_with_training(&source, from, to, training)
-        });
+        let task = cx.background_spawn(async move { analysis::inspect_range(&source, from, to) });
         cx.spawn(async move |view, cx| {
             let result = task.await;
             let _ = view.update(cx, |this, cx| {
@@ -2389,7 +2283,7 @@ impl Muspector {
                         let chain = scanned.chain;
                         let baseline = chain.clone();
                         let active = this.active == Some(index);
-                        let expanded = [false; 6];
+                        let expanded = [false; EFFECT_COUNT];
 
                         this.tabs[index].report.chain = chain.clone();
                         this.tabs[index].baseline = baseline.clone();
@@ -2406,12 +2300,8 @@ impl Muspector {
                             this.dirty = audio_dirty;
                             this.audio_dirty = audio_dirty;
                             this.edit = None;
-                            this.cards = [0; 6];
-                            this.folds = [0; 6];
+                            this.clear_effect_motion();
                             this.expanded = expanded;
-                            this.moves = [0; 6];
-                            this.shifts = [0.0; 6];
-                            this.dragging = None;
                             this.selection = Some(selection);
                             this.record("Rescan selection", false);
                         } else {
@@ -2531,7 +2421,6 @@ impl Muspector {
         self.playback = self.playback.wrapping_add(1);
         self.job = self.job.wrapping_add(1);
         let job = self.job;
-        let training = self.training.clone();
         let task = cx.background_spawn(async move {
             let edited = match edit {
                 AudioEdit::Delete => crate::clip::delete(&source, start, end),
@@ -2542,7 +2431,7 @@ impl Muspector {
                     end,
                 ),
             }?;
-            let mut report = analysis::inspect_with_training(&edited.path, training)?;
+            let mut report = analysis::inspect(&edited.path)?;
             report.path = logical.clone();
             report.chain = chain;
             Ok::<_, anyhow::Error>((logical, edited.path, Box::new(report)))
@@ -2700,8 +2589,8 @@ impl Muspector {
         let effect = report.chain.effects.remove(from);
         report.chain.effects.insert(to, effect);
         self.mark_dirty();
-        self.moves = [0; 6];
-        self.shifts = [0.0; 6];
+        self.moves = [0; EFFECT_COUNT];
+        self.shifts = [0.0; EFFECT_COUNT];
         self.motion = self.motion.wrapping_add(1).max(1);
         let motion = self.motion;
         if from < to {
@@ -2730,8 +2619,8 @@ impl Muspector {
             cx.background_executor().timer(CARD).await;
             let _ = view.update(cx, move |this, cx| {
                 if this.motion == motion {
-                    this.moves = [0; 6];
-                    this.shifts = [0.0; 6];
+                    this.moves = [0; EFFECT_COUNT];
+                    this.shifts = [0.0; EFFECT_COUNT];
                     cx.notify();
                 }
             });
@@ -3015,17 +2904,15 @@ impl Muspector {
             .pending_active
             .and_then(|id| self.pending.iter().find(|pending| pending.id == id))
             .or_else(|| self.pending.iter().find(|pending| pending.path == path));
-        let progress = pending.map_or(0.0, |pending| pending.progress);
-        let previous = pending.map_or(progress, |pending| pending.previous);
+        let displayed_progress = pending.map_or(0.0, |pending| pending.displayed_progress);
         let stage = pending.map_or("Preparing", |pending| pending.stage);
-        let motion = pending.map_or(0, |pending| pending.motion);
         let name = path
             .file_name()
             .and_then(|value| value.to_str())
             .unwrap_or("Audio")
             .to_owned();
         let bar = div()
-            .w(relative(progress))
+            .w(relative(displayed_progress))
             .h_full()
             .rounded_full()
             .bg(linear_gradient(
@@ -3033,16 +2920,6 @@ impl Muspector {
                 linear_color_stop(theme::ACCENT_SOFT, 0.0),
                 linear_color_stop(theme::ACCENT, 1.0),
             ));
-        let bar = if motion == 0 {
-            bar.into_any_element()
-        } else {
-            bar.with_animation(
-                ("inspect-progress", motion),
-                Animation::new(TINT).with_easing(ease_in_out),
-                move |bar, delta| bar.w(relative(previous + (progress - previous) * delta)),
-            )
-            .into_any_element()
-        };
         div()
             .flex_1()
             .w_full()
@@ -3075,12 +2952,10 @@ impl Muspector {
                     .text_color(theme::INK)
                     .child("Inspecting"),
             )
-            .child(
-                div()
-                    .text_sm()
-                    .text_color(theme::MUTED)
-                    .child(format!("{name}  ·  {stage}  ·  {:.0}%", progress * 100.0)),
-            )
+            .child(div().text_sm().text_color(theme::MUTED).child(format!(
+                "{name}  ·  {stage}  ·  {:.0}%",
+                displayed_progress * 100.0
+            )))
             .into_any_element()
     }
 
@@ -3151,9 +3026,7 @@ impl Muspector {
             .and_then(|name| name.to_str())
             .unwrap_or("Audio")
             .to_owned();
-        let progress = pending.progress;
-        let previous = pending.previous;
-        let motion = pending.motion;
+        let progress = pending.displayed_progress;
         let bar = div()
             .absolute()
             .bottom_0()
@@ -3162,17 +3035,6 @@ impl Muspector {
             .h(px(2.0))
             .rounded_full()
             .bg(theme::ACCENT);
-        let bar = if motion == 0 {
-            bar.into_any_element()
-        } else {
-            let token = (id as usize).wrapping_mul(10_000).wrapping_add(motion);
-            bar.with_animation(
-                ("pending-progress", token),
-                Animation::new(TINT).with_easing(ease_in_out),
-                move |bar, delta| bar.w(relative(previous + (progress - previous) * delta)),
-            )
-            .into_any_element()
-        };
         div()
             .id(("pending-tab", id as usize))
             .h_full()
@@ -3579,7 +3441,7 @@ impl Muspector {
                     .size(px(26.0))
                     .flex_none()
                     .rounded(theme::RADIUS)
-                    .text_color(if self.training_open {
+                    .text_color(if self.floating_menu == Some(FloatingMenu::Model) {
                         theme::ACCENT
                     } else {
                         theme::MUTED
@@ -3590,11 +3452,11 @@ impl Muspector {
                     .cursor_pointer()
                     .hover(|node| node.bg(theme::HOVER).text_color(theme::INK))
                     .on_click(cx.listener(|this, _event, _window, cx| {
-                        this.set_training_open(!this.training_open, cx);
+                        this.toggle_floating_menu(FloatingMenu::Model, cx);
                     }))
                     .child(Icon::Wave.draw(
                         px(15.0),
-                        if self.training_open {
+                        if self.floating_menu == Some(FloatingMenu::Model) {
                             theme::ACCENT
                         } else {
                             theme::MUTED
@@ -3607,7 +3469,7 @@ impl Muspector {
                     .size(px(26.0))
                     .flex_none()
                     .rounded(theme::RADIUS)
-                    .text_color(if self.settings_open {
+                    .text_color(if self.floating_menu == Some(FloatingMenu::Settings) {
                         theme::ACCENT
                     } else {
                         theme::MUTED
@@ -3618,11 +3480,11 @@ impl Muspector {
                     .cursor_pointer()
                     .hover(|node| node.bg(theme::HOVER).text_color(theme::INK))
                     .on_click(cx.listener(|this, _event, _window, cx| {
-                        this.set_settings_open(!this.settings_open, cx);
+                        this.toggle_floating_menu(FloatingMenu::Settings, cx);
                     }))
                     .child(Icon::Settings.draw(
                         px(15.0),
-                        if self.settings_open {
+                        if self.floating_menu == Some(FloatingMenu::Settings) {
                             theme::ACCENT
                         } else {
                             theme::MUTED
@@ -3641,328 +3503,239 @@ impl Muspector {
             .into_any_element()
     }
 
-    fn settings_menu(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        (self.settings_open || self.settings_motion != 0).then(|| {
-            let current = self
-                .output
-                .as_ref()
-                .and_then(|id| self.outputs.iter().find(|output| &output.id == id));
-            let summary = current
-                .map(|output| format!("{} · {}", output.backend, output.name))
-                .unwrap_or_else(|| "Operating system default".to_owned());
+    fn settings_menu(&self, cx: &mut Context<Self>) -> AnyElement {
+        let current = self
+            .output
+            .as_ref()
+            .and_then(|id| self.outputs.iter().find(|output| &output.id == id));
+        let summary = current
+            .map(|output| format!("{} · {}", output.backend, output.name))
+            .unwrap_or_else(|| "Operating system default".to_owned());
 
-            let default_selected = self.output.is_none();
-            let mut menu = div()
-                .id("settings-menu")
-                .absolute()
-                .top(px(38.0))
-                .right(px(112.0))
-                .w(px(300.0))
-                .max_h(px(430.0))
-                .rounded(theme::RADIUS)
-                .border_1()
-                .border_color(theme::LINE)
-                .bg(theme::PANEL)
-                .shadow_md()
-                .flex()
-                .flex_col()
-                .overflow_hidden()
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|_this, _event, _window, cx| cx.stop_propagation()),
-                )
-                .child(
-                    div()
-                        .px_3()
-                        .py_3()
-                        .border_b_1()
-                        .border_color(theme::LINE)
-                        .flex()
-                        .flex_col()
-                        .gap_1()
-                        .child(
-                            div()
-                                .text_size(px(9.0))
-                                .text_color(theme::FAINT)
-                                .child("AUDIO OUTPUT"),
-                        )
-                        .child(
-                            div()
-                                .overflow_hidden()
-                                .whitespace_nowrap()
-                                .text_sm()
-                                .font_weight(gpui::FontWeight::SEMIBOLD)
-                                .text_color(theme::INK)
-                                .child(summary),
-                        )
-                        .child(
-                            div()
-                                .text_size(px(9.0))
-                                .text_color(theme::FAINT)
-                                .child("Playback uses rodio and CPAL"),
-                        ),
-                )
-                .child(output_row(
-                    "system-output",
-                    "System Default".to_owned(),
-                    "Follow the operating system output".to_owned(),
-                    default_selected,
-                    cx.listener(|this, _event, _window, cx| {
-                        this.select_output(None, cx);
-                    }),
-                ));
-
-            let list = div()
-                .id("audio-output-list")
-                .max_h(px(280.0))
-                .overflow_y_scroll()
-                .children(self.outputs.iter().enumerate().map(|(index, output)| {
-                    let id = output.id.clone();
-                    let selected = self.output.as_deref() == Some(output.id.as_str());
-                    let detail = if output.default {
-                        format!("{} · OS default", output.backend)
-                    } else {
-                        output.backend.clone()
-                    };
-                    output_row(
-                        ("audio-output", index),
-                        output.name.clone(),
-                        detail,
-                        selected,
-                        cx.listener(move |this, _event, _window, cx| {
-                            this.select_output(Some(id.clone()), cx);
-                        }),
-                    )
-                }));
-            menu = menu.child(list).child(
+        let default_selected = self.output.is_none();
+        let mut menu = div()
+            .id("settings-menu")
+            .absolute()
+            .top(px(38.0))
+            .right(px(112.0))
+            .w(px(300.0))
+            .max_h(px(430.0))
+            .rounded(theme::RADIUS)
+            .border_1()
+            .border_color(theme::LINE)
+            .bg(theme::PANEL)
+            .shadow_md()
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|_this, _event, _window, cx| cx.stop_propagation()),
+            )
+            .child(
                 div()
                     .px_3()
-                    .py_2()
-                    .border_t_1()
+                    .py_3()
+                    .border_b_1()
                     .border_color(theme::LINE)
-                    .text_size(px(9.0))
-                    .line_height(px(12.0))
-                    .text_color(theme::FAINT)
-                    .child(if cfg!(target_os = "windows") {
-                        "WASAPI is built in. ASIO devices appear in builds made with --features asio."
-                    } else if cfg!(target_os = "macos") {
-                        "CoreAudio devices are available directly."
-                    } else {
-                        "Available CPAL output backends are shown above."
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_size(px(9.0))
+                            .text_color(theme::FAINT)
+                            .child("AUDIO OUTPUT"),
+                    )
+                    .child(
+                        div()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_sm()
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(theme::INK)
+                            .child(summary),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(9.0))
+                            .text_color(theme::FAINT)
+                            .child("Playback uses rodio and CPAL"),
+                    ),
+            )
+            .child(output_row(
+                "system-output",
+                "System Default".to_owned(),
+                "Follow the operating system output".to_owned(),
+                default_selected,
+                cx.listener(|this, _event, _window, cx| {
+                    this.select_output(None, cx);
+                }),
+            ));
+
+        let list = div()
+            .id("audio-output-list")
+            .max_h(px(280.0))
+            .overflow_y_scroll()
+            .children(self.outputs.iter().enumerate().map(|(index, output)| {
+                let id = output.id.clone();
+                let selected = self.output.as_deref() == Some(output.id.as_str());
+                let detail = if output.default {
+                    format!("{} · OS default", output.backend)
+                } else {
+                    output.backend.clone()
+                };
+                output_row(
+                    ("audio-output", index),
+                    output.name.clone(),
+                    detail,
+                    selected,
+                    cx.listener(move |this, _event, _window, cx| {
+                        this.select_output(Some(id.clone()), cx);
                     }),
-            );
-            let menu = if self.settings_motion == 0 {
-                menu.into_any_element()
-            } else {
-                let opening = self.settings_open;
-                menu.with_animation(
-                    ("settings-menu", self.settings_motion),
-                    Animation::new(TINT).with_easing(ease_in_out),
-                    move |menu, delta| menu.opacity(if opening { delta } else { 1.0 - delta }),
                 )
-                .into_any_element()
-            };
+            }));
+        menu = menu.child(list).child(
             div()
-                .id("settings-dismiss")
-                .absolute()
-                .top_0()
-                .right_0()
-                .bottom_0()
-                .left_0()
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|this, _event, _window, cx| {
-                        this.set_settings_open(false, cx);
-                    }),
-                )
-                .child(menu)
-                .into_any_element()
-        })
+                .px_3()
+                .py_2()
+                .border_t_1()
+                .border_color(theme::LINE)
+                .text_size(px(9.0))
+                .line_height(px(12.0))
+                .text_color(theme::FAINT)
+                .child(if cfg!(target_os = "windows") {
+                    "WASAPI is built in. ASIO devices appear in builds made with --features asio."
+                } else if cfg!(target_os = "macos") {
+                    "CoreAudio devices are available directly."
+                } else {
+                    "Available CPAL output backends are shown above."
+                }),
+        );
+        if self.menu_motion == 0 {
+            menu.into_any_element()
+        } else {
+            let opening = self.floating_menu.is_some();
+            menu.with_animation(
+                ("settings-menu", self.menu_motion),
+                Animation::new(TINT).with_easing(ease_in_out),
+                move |menu, delta| menu.opacity(if opening { delta } else { 1.0 - delta }),
+            )
+            .into_any_element()
+        }
     }
 
-    fn training_menu(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        (self.training_open || self.training_motion != 0).then(|| {
-            let menu = div()
-                .id("training-menu")
-                .absolute()
-                .top(px(38.0))
-                .right(px(150.0))
-                .w(px(264.0))
-                .rounded(theme::RADIUS)
-                .border_1()
-                .border_color(theme::LINE)
-                .bg(theme::PANEL)
-                .shadow_md()
-                .flex()
-                .flex_col()
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|_this, _event, _window, cx| cx.stop_propagation()),
-                )
-                .child(
-                    div()
-                        .px_3()
-                        .py_3()
-                        .border_b_1()
-                        .border_color(theme::LINE)
-                        .flex()
-                        .flex_col()
-                        .gap_1()
-                        .child(
-                            div()
-                                .text_size(px(9.0))
-                                .text_color(theme::FAINT)
-                                .child("ACTIVE INSPECTOR TRAINING"),
-                        )
-                        .child(
-                            div()
-                                .overflow_hidden()
-                                .whitespace_nowrap()
-                                .text_sm()
-                                .font_weight(gpui::FontWeight::SEMIBOLD)
-                                .text_color(theme::INK)
-                                .child(self.training.name().to_owned()),
-                        )
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(if self.training.calibrated() {
-                                    theme::ACCENT
-                                } else {
-                                    theme::MUTED
-                                })
-                                .child(self.training.summary()),
-                        ),
-                )
-                .child(
-                    div()
-                        .id("import-clean")
-                        .h(px(42.0))
-                        .px_3()
-                        .flex()
-                        .items_center()
-                        .cursor_pointer()
-                        .hover(|node| node.bg(theme::HOVER))
-                        .on_click(cx.listener(|this, _event, _window, cx| {
-                            this.import_clean(cx);
-                        }))
-                        .child(
-                            div()
-                                .flex()
-                                .flex_col()
-                                .child(div().text_sm().child("Import Clean Audio"))
-                                .child(
-                                    div()
-                                        .text_size(px(9.0))
-                                        .text_color(theme::FAINT)
-                                        .child("Build and replace the clean reference"),
-                                ),
-                        ),
-                )
-                .child(
-                    div()
-                        .id("import-training")
-                        .h(px(42.0))
-                        .px_3()
-                        .flex()
-                        .items_center()
-                        .cursor_pointer()
-                        .hover(|node| node.bg(theme::HOVER))
-                        .on_click(cx.listener(|this, _event, _window, cx| {
-                            this.import_training(cx);
-                        }))
-                        .child(
-                            div()
-                                .flex()
-                                .flex_col()
-                                .child(div().text_sm().child("Import Training File"))
-                                .child(
-                                    div()
-                                        .text_size(px(9.0))
-                                        .text_color(theme::FAINT)
-                                        .child("Restore a portable .musp-training profile"),
-                                ),
-                        ),
-                )
-                .child(
-                    div()
-                        .id("restore-default-training")
-                        .h(px(42.0))
-                        .px_3()
-                        .flex()
-                        .items_center()
-                        .cursor_pointer()
-                        .hover(|node| node.bg(theme::HOVER))
-                        .on_click(cx.listener(|this, _event, _window, cx| {
-                            this.restore_default_training(cx);
-                        }))
-                        .child(
-                            div()
-                                .flex()
-                                .flex_col()
-                                .child(div().text_sm().child("Restore Default Clean"))
-                                .child(
-                                    div()
-                                        .text_size(px(9.0))
-                                        .text_color(theme::FAINT)
-                                        .child("Use the bundled clean reference"),
-                                ),
-                        ),
-                )
-                .child(
-                    div()
-                        .id("export-training")
-                        .h(px(42.0))
-                        .px_3()
-                        .border_t_1()
-                        .border_color(theme::LINE)
-                        .flex()
-                        .items_center()
-                        .cursor_pointer()
-                        .hover(|node| node.bg(theme::HOVER))
-                        .on_click(cx.listener(|this, _event, _window, cx| {
-                            this.export_training(cx);
-                        }))
-                        .child(
-                            div()
-                                .flex()
-                                .flex_col()
-                                .child(div().text_sm().child("Export Current Training"))
-                                .child(
-                                    div()
-                                        .text_size(px(9.0))
-                                        .text_color(theme::FAINT)
-                                        .child("Copy this profile to another computer"),
-                                ),
-                        ),
-                );
-            let menu = if self.training_motion == 0 {
-                menu.into_any_element()
-            } else {
-                let opening = self.training_open;
-                menu.with_animation(
-                    ("training-menu", self.training_motion),
-                    Animation::new(TINT).with_easing(ease_in_out),
-                    move |menu, delta| menu.opacity(if opening { delta } else { 1.0 - delta }),
-                )
-                .into_any_element()
-            };
-            div()
-                .id("training-dismiss")
-                .absolute()
-                .top_0()
-                .right_0()
-                .bottom_0()
-                .left_0()
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|this, _event, _window, cx| {
-                        this.set_training_open(false, cx);
-                    }),
-                )
-                .child(menu)
-                .into_any_element()
-        })
+    fn model_menu(&self, cx: &mut Context<Self>) -> AnyElement {
+        let menu = div()
+            .id("model-menu")
+            .absolute()
+            .top(px(38.0))
+            .right(px(150.0))
+            .w(px(264.0))
+            .rounded(theme::RADIUS)
+            .border_1()
+            .border_color(theme::LINE)
+            .bg(theme::PANEL)
+            .shadow_md()
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|_this, _event, _window, cx| cx.stop_propagation()),
+            )
+            .child(
+                div()
+                    .px_3()
+                    .py_3()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_size(px(9.0))
+                            .text_color(theme::FAINT)
+                            .child("MODEL RUNTIME"),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(theme::INK)
+                            .child("Not connected"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(9.0))
+                            .line_height(px(12.0))
+                            .text_color(theme::FAINT)
+                            .child("Connect a muspector-models adapter through the unified model interface."),
+                    ),
+            );
+        if self.menu_motion == 0 {
+            menu.into_any_element()
+        } else {
+            let opening = self.floating_menu.is_some();
+            menu.with_animation(
+                ("model-menu", self.menu_motion),
+                Animation::new(TINT).with_easing(ease_in_out),
+                move |menu, delta| menu.opacity(if opening { delta } else { 1.0 - delta }),
+            )
+            .into_any_element()
+        }
+    }
+
+    fn floating_menu_layers(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let Some(menu) = self.visible_menu else {
+            return Vec::new();
+        };
+        let dismiss_left = div()
+            .id("menu-dismiss-left")
+            .absolute()
+            .top_0()
+            .left_0()
+            .right(px(188.0))
+            .h(px(44.0))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _event, _window, cx| {
+                    this.set_floating_menu(None, cx);
+                }),
+            )
+            .into_any_element();
+        let dismiss_right = div()
+            .id("menu-dismiss-right")
+            .absolute()
+            .top_0()
+            .right_0()
+            .w(px(112.0))
+            .h(px(44.0))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _event, _window, cx| {
+                    this.set_floating_menu(None, cx);
+                }),
+            )
+            .into_any_element();
+        let dismiss_body = div()
+            .id("menu-dismiss-body")
+            .absolute()
+            .top(px(44.0))
+            .right_0()
+            .bottom_0()
+            .left_0()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _event, _window, cx| {
+                    this.set_floating_menu(None, cx);
+                }),
+            )
+            .into_any_element();
+        let menu = match menu {
+            FloatingMenu::Model => self.model_menu(cx),
+            FloatingMenu::Settings => self.settings_menu(cx),
+        };
+        vec![dismiss_left, dismiss_right, dismiss_body, menu]
     }
 
     fn overview(&self, report: &Report, cx: &mut Context<Self>) -> AnyElement {
@@ -4384,58 +4157,26 @@ impl Muspector {
                     .child(format!("{current}/{total}")),
             )
             .child(div().flex_1())
-            .child(
-                div()
-                    .id("undo")
-                    .size(px(22.0))
-                    .rounded(theme::RADIUS)
-                    .opacity(if can_undo { 1.0 } else { 0.35 })
-                    .text_sm()
-                    .text_color(theme::MUTED)
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .hover(|node| node.bg(theme::HOVER).text_color(theme::INK))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|_this, _event, _window, cx| cx.stop_propagation()),
-                    )
-                    .on_click(cx.listener(|this, _event, _window, cx| {
-                        cx.stop_propagation();
-                        this.undo(cx);
-                    }))
-                    .child(
-                        Icon::Undo
-                            .draw(px(13.0), theme::MUTED)
-                            .hover(|icon| icon.text_color(theme::INK)),
-                    ),
-            )
-            .child(
-                div()
-                    .id("redo")
-                    .size(px(22.0))
-                    .rounded(theme::RADIUS)
-                    .opacity(if can_redo { 1.0 } else { 0.35 })
-                    .text_sm()
-                    .text_color(theme::MUTED)
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .hover(|node| node.bg(theme::HOVER).text_color(theme::INK))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|_this, _event, _window, cx| cx.stop_propagation()),
-                    )
-                    .on_click(cx.listener(|this, _event, _window, cx| {
-                        cx.stop_propagation();
-                        this.redo(cx);
-                    }))
-                    .child(
-                        Icon::Redo
-                            .draw(px(13.0), theme::MUTED)
-                            .hover(|icon| icon.text_color(theme::INK)),
-                    ),
-            )
+            .child(history_action(
+                "undo",
+                Icon::Undo,
+                can_undo,
+                cx.listener(|this, _event, _window, cx| {
+                    cx.stop_propagation();
+                    this.undo(cx);
+                }),
+                cx,
+            ))
+            .child(history_action(
+                "redo",
+                Icon::Redo,
+                can_redo,
+                cx.listener(|this, _event, _window, cx| {
+                    cx.stop_propagation();
+                    this.redo(cx);
+                }),
+                cx,
+            ))
             .child(
                 div()
                     .ml_1()
@@ -5286,13 +5027,8 @@ impl Muspector {
                             .text_xs()
                             .text_color(theme::MUTED)
                             .child(format!(
-                                "· {:.0}% {} candidate",
-                                report.chain.score * 100.0,
-                                if report.chain.blind {
-                                    "hybrid"
-                                } else {
-                                    "heuristic"
-                                }
+                                "· {:.0}% heuristic candidate",
+                                report.chain.score * 100.0
                             )),
                     )
                     .child(
@@ -5754,9 +5490,38 @@ impl Render for Muspector {
                     .child(bar(&self.tracks[0])),
             )
             .children(self.toast())
-            .children(self.training_menu(cx))
-            .children(self.settings_menu(cx))
+            .children(self.floating_menu_layers(cx))
     }
+}
+
+fn history_action(
+    id: &'static str,
+    icon: Icon,
+    enabled: bool,
+    click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    cx: &mut Context<Muspector>,
+) -> AnyElement {
+    div()
+        .id(id)
+        .size(px(22.0))
+        .rounded(theme::RADIUS)
+        .opacity(if enabled { 1.0 } else { 0.35 })
+        .text_sm()
+        .text_color(theme::MUTED)
+        .flex()
+        .items_center()
+        .justify_center()
+        .hover(|node| node.bg(theme::HOVER).text_color(theme::INK))
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|_this, _event, _window, cx| cx.stop_propagation()),
+        )
+        .on_click(click)
+        .child(
+            icon.draw(px(13.0), theme::MUTED)
+                .hover(|icon| icon.text_color(theme::INK)),
+        )
+        .into_any_element()
 }
 
 fn output_row(
@@ -5884,6 +5649,75 @@ fn set_scroll(handle: &ScrollHandle, height: f32, local: f32, anchor: f32) {
     handle.set_offset(point(handle.offset().x, px(-maximum * progress)));
 }
 
+#[derive(Clone, Copy)]
+enum ScrollAxis {
+    Horizontal,
+    Vertical,
+}
+
+fn paint_scroll_thumb(
+    axis: ScrollAxis,
+    handle: &ScrollHandle,
+    bounds: Bounds<Pixels>,
+    window: &mut Window,
+) {
+    let (maximum, length, viewport, offset, minimum) = match axis {
+        ScrollAxis::Horizontal => (
+            f32::from(handle.max_offset().x).max(0.0),
+            f32::from(bounds.size.width),
+            f32::from(handle.bounds().size.width).max(1.0),
+            f32::from(handle.offset().x),
+            40.0,
+        ),
+        ScrollAxis::Vertical => (
+            f32::from(handle.max_offset().y).max(0.0),
+            f32::from(bounds.size.height),
+            f32::from(handle.bounds().size.height).max(1.0),
+            f32::from(handle.offset().y),
+            28.0,
+        ),
+    };
+    if maximum <= 0.5 {
+        return;
+    }
+
+    let thumb = (length * viewport / (viewport + maximum)).clamp(minimum, length);
+    let progress = (-offset / maximum).clamp(0.0, 1.0);
+    let start = px(match axis {
+        ScrollAxis::Horizontal => f32::from(bounds.origin.x),
+        ScrollAxis::Vertical => f32::from(bounds.origin.y),
+    } + (length - thumb) * progress);
+    let (left, right, top, bottom) = match axis {
+        ScrollAxis::Horizontal => (
+            start,
+            start + px(thumb),
+            bounds.origin.y,
+            bounds.origin.y + bounds.size.height,
+        ),
+        ScrollAxis::Vertical => (
+            bounds.origin.x,
+            bounds.origin.x + bounds.size.width,
+            start,
+            start + px(thumb),
+        ),
+    };
+    let mut path = PathBuilder::fill();
+    path.add_polygon(
+        &[
+            point(left, top),
+            point(right, top),
+            point(right, bottom),
+            point(left, bottom),
+        ],
+        true,
+    );
+    if let Ok(path) = path.build() {
+        let mut color = theme::FAINT;
+        color.a = 0.72;
+        window.paint_path(path, color);
+    }
+}
+
 fn bar(handle: &ScrollHandle) -> AnyElement {
     let handle = handle.clone();
     div()
@@ -5896,34 +5730,7 @@ fn bar(handle: &ScrollHandle) -> AnyElement {
             canvas(
                 move |_, _, _| {},
                 move |bounds, _, window, _| {
-                    let maximum = f32::from(handle.max_offset().y).max(0.0);
-                    if maximum <= 0.5 {
-                        return;
-                    }
-                    let height = f32::from(bounds.size.height);
-                    let viewport = f32::from(handle.bounds().size.height).max(1.0);
-                    let thumb = (height * viewport / (viewport + maximum)).clamp(28.0, height);
-                    let progress = (-f32::from(handle.offset().y) / maximum).clamp(0.0, 1.0);
-                    let top = f32::from(bounds.origin.y) + (height - thumb) * progress;
-                    let left = bounds.origin.x;
-                    let right = bounds.origin.x + bounds.size.width;
-                    let top = px(top);
-                    let bottom = top + px(thumb);
-                    let mut path = PathBuilder::fill();
-                    path.add_polygon(
-                        &[
-                            point(left, top),
-                            point(right, top),
-                            point(right, bottom),
-                            point(left, bottom),
-                        ],
-                        true,
-                    );
-                    if let Ok(path) = path.build() {
-                        let mut color = theme::FAINT;
-                        color.a = 0.72;
-                        window.paint_path(path, color);
-                    }
+                    paint_scroll_thumb(ScrollAxis::Vertical, &handle, bounds, window);
                 },
             )
             .size_full(),
@@ -5943,39 +5750,76 @@ fn hbar(handle: &ScrollHandle) -> AnyElement {
             canvas(
                 move |_, _, _| {},
                 move |bounds, _, window, _| {
-                    let maximum = f32::from(handle.max_offset().x).max(0.0);
-                    if maximum <= 0.5 {
-                        return;
-                    }
-                    let width = f32::from(bounds.size.width);
-                    let viewport = f32::from(handle.bounds().size.width).max(1.0);
-                    let thumb = (width * viewport / (viewport + maximum)).clamp(40.0, width);
-                    let progress = (-f32::from(handle.offset().x) / maximum).clamp(0.0, 1.0);
-                    let left = f32::from(bounds.origin.x) + (width - thumb) * progress;
-                    let top = bounds.origin.y;
-                    let bottom = bounds.origin.y + bounds.size.height;
-                    let left = px(left);
-                    let right = left + px(thumb);
-                    let mut path = PathBuilder::fill();
-                    path.add_polygon(
-                        &[
-                            point(left, top),
-                            point(right, top),
-                            point(right, bottom),
-                            point(left, bottom),
-                        ],
-                        true,
-                    );
-                    if let Ok(path) = path.build() {
-                        let mut color = theme::FAINT;
-                        color.a = 0.72;
-                        window.paint_path(path, color);
-                    }
+                    paint_scroll_thumb(ScrollAxis::Horizontal, &handle, bounds, window);
                 },
             )
             .size_full(),
         )
         .into_any_element()
+}
+
+fn knob_face(normal: f32, default: Option<f32>, active: bool) -> Div {
+    div().size(px(46.0)).child(
+        canvas(
+            move |_, _, _| {},
+            move |bounds, _, window, _| {
+                let center = bounds.center();
+                let radius = px(18.0);
+                let mut ring = PathBuilder::stroke(px(2.0));
+                ring.move_to(point(center.x + radius, center.y));
+                ring.arc_to(
+                    point(radius, radius),
+                    px(0.0),
+                    false,
+                    false,
+                    point(center.x - radius, center.y),
+                );
+                ring.arc_to(
+                    point(radius, radius),
+                    px(0.0),
+                    false,
+                    false,
+                    point(center.x + radius, center.y),
+                );
+                if let Ok(path) = ring.build() {
+                    window.paint_path(path, if active { theme::LINE } else { theme::FAINT });
+                }
+
+                if let Some(default) = default {
+                    let angle = (-135.0_f32 + default * 270.0).to_radians();
+                    let start = point(
+                        center.x + px(angle.sin() * 15.0),
+                        center.y - px(angle.cos() * 15.0),
+                    );
+                    let end = point(
+                        center.x + px(angle.sin() * 20.0),
+                        center.y - px(angle.cos() * 20.0),
+                    );
+                    let mut marker = PathBuilder::stroke(px(3.0));
+                    marker.move_to(start);
+                    marker.line_to(end);
+                    if let Ok(path) = marker.build() {
+                        let mut color = theme::FAINT;
+                        color.a = if active { 0.82 } else { 0.46 };
+                        window.paint_path(path, color);
+                    }
+                }
+
+                let angle = (-135.0_f32 + normal * 270.0).to_radians();
+                let end = point(
+                    center.x + px(angle.sin() * 13.0),
+                    center.y - px(angle.cos() * 13.0),
+                );
+                let mut hand = PathBuilder::stroke(px(2.0));
+                hand.move_to(center);
+                hand.line_to(end);
+                if let Ok(path) = hand.build() {
+                    window.paint_path(path, if active { theme::ACCENT } else { theme::MUTED });
+                }
+            },
+        )
+        .size_full(),
+    )
 }
 
 fn drag_knob(index: usize, param: &Param) -> Div {
@@ -5992,49 +5836,7 @@ fn drag_knob(index: usize, param: &Param) -> Div {
         .flex_col()
         .items_center()
         .gap_1()
-        .child(
-            div().size(px(46.0)).child(
-                canvas(
-                    move |_, _, _| {},
-                    move |bounds, _, window, _| {
-                        let center = bounds.center();
-                        let radius = px(18.0);
-                        let mut ring = PathBuilder::stroke(px(2.0));
-                        ring.move_to(point(center.x + radius, center.y));
-                        ring.arc_to(
-                            point(radius, radius),
-                            px(0.0),
-                            false,
-                            false,
-                            point(center.x - radius, center.y),
-                        );
-                        ring.arc_to(
-                            point(radius, radius),
-                            px(0.0),
-                            false,
-                            false,
-                            point(center.x + radius, center.y),
-                        );
-                        if let Ok(path) = ring.build() {
-                            window.paint_path(path, theme::LINE);
-                        }
-
-                        let angle = (-135.0_f32 + normal * 270.0).to_radians();
-                        let end = point(
-                            center.x + px(angle.sin() * 13.0),
-                            center.y - px(angle.cos() * 13.0),
-                        );
-                        let mut hand = PathBuilder::stroke(px(2.0));
-                        hand.move_to(center);
-                        hand.line_to(end);
-                        if let Ok(path) = hand.build() {
-                            window.paint_path(path, theme::ACCENT);
-                        }
-                    },
-                )
-                .size_full(),
-            ),
-        )
+        .child(knob_face(normal, None, true))
         .child(
             div()
                 .text_xs()
@@ -6102,73 +5904,7 @@ fn knob(
                 }
             }),
         )
-        .child(
-            div().size(px(46.0)).child(
-                canvas(
-                    move |_, _, _| {},
-                    move |bounds, _, window, _| {
-                        let center = bounds.center();
-                        let radius = px(18.0);
-                        let mut ring = PathBuilder::stroke(px(2.0));
-                        ring.move_to(point(center.x + radius, center.y));
-                        ring.arc_to(
-                            point(radius, radius),
-                            px(0.0),
-                            false,
-                            false,
-                            point(center.x - radius, center.y),
-                        );
-                        ring.arc_to(
-                            point(radius, radius),
-                            px(0.0),
-                            false,
-                            false,
-                            point(center.x + radius, center.y),
-                        );
-                        if let Ok(path) = ring.build() {
-                            window
-                                .paint_path(path, if active { theme::LINE } else { theme::FAINT });
-                        }
-
-                        if let Some(default) = default {
-                            let angle = (-135.0_f32 + default * 270.0).to_radians();
-                            let start = point(
-                                center.x + px(angle.sin() * 15.0),
-                                center.y - px(angle.cos() * 15.0),
-                            );
-                            let end = point(
-                                center.x + px(angle.sin() * 20.0),
-                                center.y - px(angle.cos() * 20.0),
-                            );
-                            let mut marker = PathBuilder::stroke(px(3.0));
-                            marker.move_to(start);
-                            marker.line_to(end);
-                            if let Ok(path) = marker.build() {
-                                let mut color = theme::FAINT;
-                                color.a = if active { 0.82 } else { 0.46 };
-                                window.paint_path(path, color);
-                            }
-                        }
-
-                        let angle = (-135.0_f32 + normal * 270.0).to_radians();
-                        let end = point(
-                            center.x + px(angle.sin() * 13.0),
-                            center.y - px(angle.cos() * 13.0),
-                        );
-                        let mut hand = PathBuilder::stroke(px(2.0));
-                        hand.move_to(center);
-                        hand.line_to(end);
-                        if let Ok(path) = hand.build() {
-                            window.paint_path(
-                                path,
-                                if active { theme::ACCENT } else { theme::MUTED },
-                            );
-                        }
-                    },
-                )
-                .size_full(),
-            ),
-        )
+        .child(knob_face(normal, default, active))
         .child(
             div()
                 .text_xs()
@@ -6763,6 +6499,17 @@ fn supported(path: &std::path::Path) -> bool {
         .unwrap_or(false)
 }
 
+fn advance_progress(current: f32, target: f32) -> f32 {
+    let current = current.clamp(0.0, 1.0);
+    let target = target.clamp(current, 1.0);
+    let remaining = target - current;
+    if remaining <= 0.001 {
+        target
+    } else {
+        current + remaining * 0.14
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6819,7 +6566,7 @@ mod tests {
             revision,
             baseline,
             dirty,
-            expanded: [false; 6],
+            expanded: [false; EFFECT_COUNT],
             selection: None,
             playhead: None,
             looped: false,
@@ -6911,5 +6658,13 @@ mod tests {
         assert_eq!(memory_level(3 * GIB, 64 * GIB), 2);
         assert_eq!(memory_level(768 * 1_024 * 1_024, 64 * GIB), 3);
         assert_eq!(memory_level(0, 0), 0);
+    }
+
+    #[test]
+    fn progress_advances_smoothly_without_regressing() {
+        let first = advance_progress(0.2, 0.8);
+        assert!(first > 0.2 && first < 0.8);
+        assert_eq!(advance_progress(first, 0.1), first);
+        assert_eq!(advance_progress(0.9995, 1.0), 1.0);
     }
 }

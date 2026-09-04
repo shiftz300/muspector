@@ -72,7 +72,7 @@ jobs:
           cache-on-failure: true
 
       - name: Build optimized executable
-        run: cargo build --locked --release --features embedded-identity --target ${{ matrix.target }}
+        run: cargo build --locked --release --target ${{ matrix.target }}
 
       - name: Stage executable
         shell: bash
@@ -167,17 +167,17 @@ jobs:
 
           if gh release view latest >/dev/null 2>&1; then
             gh release edit latest \
-              --title "Latest non-commercial research build" \
+              --title "Latest build" \
               --target "$GITHUB_SHA" \
               --latest \
-              --notes "Automated non-commercial research build from $GITHUB_SHA. The embedded AFx pedal-identity model is a separately licensed non-commercial component; see models/inspector/AFX_PEDAL_IDENTITY_NOTICE.md."
+              --notes "Automated build from $GITHUB_SHA. Model packages are not bundled; connect them through a muspector-models adapter."
           else
             gh release create latest \
               --verify-tag \
-              --title "Latest non-commercial research build" \
+              --title "Latest build" \
               --target "$GITHUB_SHA" \
               --latest \
-              --notes "Automated non-commercial research build from $GITHUB_SHA. The embedded AFx pedal-identity model is a separately licensed non-commercial component; see models/inspector/AFX_PEDAL_IDENTITY_NOTICE.md."
+              --notes "Automated build from $GITHUB_SHA. Model packages are not bundled; connect them through a muspector-models adapter."
           fi
 
           gh release upload latest dist/* --clobber

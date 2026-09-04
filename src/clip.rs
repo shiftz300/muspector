@@ -140,6 +140,9 @@ impl Wav {
     }
 
     fn write(&mut self, samples: &[f32]) -> Result<()> {
+        if samples.iter().any(|sample| !sample.is_finite()) {
+            bail!("refusing to write non-finite audio samples");
+        }
         let mut bytes = Vec::with_capacity(samples.len() * 4);
         for sample in samples {
             bytes.extend_from_slice(&sample.to_le_bytes());
@@ -322,6 +325,15 @@ mod tests {
         total
     }
 
+    fn samples(path: &Path) -> Vec<f32> {
+        let mut source = Source::open(path).expect("open generated WAV");
+        let mut result = Vec::new();
+        while let Some(packet) = source.next().expect("decode generated WAV") {
+            result.extend(packet);
+        }
+        result
+    }
+
     #[test]
     fn range_edits_preserve_frame_boundaries() {
         let source = temporary();
@@ -346,6 +358,29 @@ mod tests {
         assert_eq!(frames(&pasted.path), 1_200);
 
         for path in [source, copied.path, deleted.path, pasted.path] {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    #[test]
+    fn float_edits_preserve_samples_without_normalizing_or_clipping() {
+        let source = temporary();
+        let original = [-1.25_f32, -0.5, 0.0, 0.5, 1.25];
+        let mut writer = Wav::create(&source, 48_000, 1).expect("create source");
+        writer.write(&original).expect("write source");
+        writer.finish().expect("finish source");
+        let source_bytes = std::fs::read(&source).expect("snapshot source");
+
+        let copied =
+            copy(&source, 0.0, original.len() as f64 / 48_000.0).expect("copy whole source");
+        assert_eq!(samples(&copied.path), original);
+        assert_eq!(std::fs::read(&source).expect("reread source"), source_bytes);
+
+        let invalid = temporary();
+        let mut invalid_writer = Wav::create(&invalid, 48_000, 1).expect("create invalid WAV");
+        assert!(invalid_writer.write(&[f32::NAN]).is_err());
+
+        for path in [source, copied.path, invalid] {
             let _ = std::fs::remove_file(path);
         }
     }

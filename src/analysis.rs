@@ -1,7 +1,4 @@
-use crate::{
-    blind,
-    chain::{self, Chain, Fingerprint},
-};
+use crate::chain::{self, Chain, Fingerprint};
 use anyhow::{Context, Result, bail};
 use ebur128::{EbuR128, Mode};
 use realfft::{RealFftPlanner, RealToComplex};
@@ -99,44 +96,24 @@ impl Report {
     }
 }
 
-#[cfg(test)]
 pub fn inspect(path: &Path) -> Result<Report> {
-    inspect_with_training(path, blind::Training::embedded())
+    inspect_span(path, None, |_| {})
 }
 
-pub fn inspect_with_training(path: &Path, training: blind::Training) -> Result<Report> {
-    inspect_span(path, None, training, |_| {})
+pub fn inspect_with_progress(path: &Path, progress: impl FnMut(Progress)) -> Result<Report> {
+    inspect_span(path, None, progress)
 }
 
-pub fn inspect_with_progress(
-    path: &Path,
-    training: blind::Training,
-    progress: impl FnMut(Progress),
-) -> Result<Report> {
-    inspect_span(path, None, training, progress)
-}
-
-#[cfg(test)]
 pub fn inspect_range(path: &Path, start: f64, end: f64) -> Result<Report> {
-    inspect_range_with_training(path, start, end, blind::Training::embedded())
-}
-
-pub fn inspect_range_with_training(
-    path: &Path,
-    start: f64,
-    end: f64,
-    training: blind::Training,
-) -> Result<Report> {
     if !start.is_finite() || !end.is_finite() || start < 0.0 || end <= start {
         bail!("Invalid analysis range");
     }
-    inspect_span(path, Some((start, end)), training, |_| {})
+    inspect_span(path, Some((start, end)), |_| {})
 }
 
 fn inspect_span(
     path: &Path,
     span: Option<(f64, f64)>,
-    training: blind::Training,
     mut progress: impl FnMut(Progress),
 ) -> Result<Report> {
     progress(Progress {
@@ -189,7 +166,6 @@ fn inspect_span(
     let mut sum = 0.0_f64;
     let mut peak = 0.0_f64;
     let mut clips = 0_u64;
-    let mut scan = blind::Scan::with_training(rate, training);
     let mut loudness =
         EbuR128::new(channels as u32, rate, Mode::I).context("无法初始化响度分析器")?;
     let from = span
@@ -275,7 +251,6 @@ fn inspect_span(
             timeline.push(mono, momentary);
             space.push(mono);
             signal.push(mono)?;
-            scan.push(mono);
         }
         if packet_end >= to {
             break 'packets;
@@ -306,19 +281,13 @@ fn inspect_span(
         value: 0.84,
         stage: "Inferring signal chain",
     });
-    let mut chain = chain::infer(fingerprint(
+    let chain = chain::infer(fingerprint(
         &profile,
         db(peak),
         db(peak) - db(rms),
         &spectrum,
         space,
     ));
-    progress(Progress {
-        value: 0.9,
-        stage: "Running blind models",
-    });
-    let model = scan.finish().context("Inspector Routed analysis failed")?;
-    model.apply(&mut chain);
     progress(Progress {
         value: 1.0,
         stage: "Finalizing",
@@ -343,82 +312,6 @@ fn inspect_span(
         profile,
         chain,
     })
-}
-
-pub fn training_from_clean(path: &Path) -> Result<blind::Training> {
-    if !path.is_file() {
-        bail!("请选择一个 clean 音频文件");
-    }
-    let source = File::open(path).with_context(|| format!("无法打开 {}", path.display()))?;
-    let stream = MediaSourceStream::new(Box::new(source), Default::default());
-    let mut hint = Hint::new();
-    if let Some(extension) = path.extension().and_then(|value| value.to_str()) {
-        hint.with_extension(extension);
-    }
-    let probed = symphonia::default::get_probe()
-        .format(
-            &hint,
-            stream,
-            &FormatOptions::default(),
-            &MetadataOptions::default(),
-        )
-        .context("不支持或无法识别这个 clean 音频文件")?;
-    let mut format = probed.format;
-    let track = format
-        .default_track()
-        .context("clean 文件中没有可解码的音轨")?;
-    let track_id = track.id;
-    let params = &track.codec_params;
-    let rate = params.sample_rate.context("clean 音频缺少采样率信息")?;
-    let channels = params
-        .channels
-        .map(|channels| channels.count())
-        .context("clean 音频缺少声道信息")?;
-    let mut decoder = symphonia::default::get_codecs()
-        .make(params, &DecoderOptions::default())
-        .context("没有适合 clean 音轨的解码器")?;
-    let mut sample_buffer = None;
-    let maximum_frames = rate as usize * 10;
-    let mut mono = Vec::with_capacity(maximum_frames);
-    loop {
-        let packet = match format.next_packet() {
-            Ok(packet) => packet,
-            Err(Error::IoError(error)) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
-                break;
-            }
-            Err(Error::ResetRequired) => bail!("clean 音轨在文件中途发生变化，暂不支持"),
-            Err(error) => return Err(error).context("读取 clean 音频失败"),
-        };
-        if packet.track_id() != track_id {
-            continue;
-        }
-        let decoded = match decoder.decode(&packet) {
-            Ok(decoded) => decoded,
-            Err(Error::DecodeError(_)) => continue,
-            Err(error) => return Err(error).context("解码 clean 音频失败"),
-        };
-        let spec = *decoded.spec();
-        let capacity = decoded.capacity() as u64;
-        let buffer = sample_buffer.get_or_insert_with(|| SampleBuffer::<f32>::new(capacity, spec));
-        buffer.copy_interleaved_ref(decoded);
-        let remaining = maximum_frames.saturating_sub(mono.len());
-        mono.extend(
-            buffer
-                .samples()
-                .chunks_exact(channels)
-                .take(remaining)
-                .map(|frame| frame.iter().copied().sum::<f32>() / channels as f32),
-        );
-        if mono.len() == maximum_frames {
-            break;
-        }
-    }
-    let name = path
-        .file_stem()
-        .and_then(|name| name.to_str())
-        .unwrap_or("Clean")
-        .to_owned();
-    blind::Training::from_clean(&mono, rate, name)
 }
 
 #[derive(Clone, Copy)]
@@ -898,7 +791,6 @@ fn codec_name(codec: CodecType, path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chain::Kind;
     use std::io::Write;
 
     #[test]
@@ -960,10 +852,7 @@ mod tests {
         drop(file);
 
         let mut progress = Vec::new();
-        let report = inspect_with_progress(&path, blind::Training::embedded(), |update| {
-            progress.push(update);
-        })
-        .unwrap();
+        let report = inspect_with_progress(&path, |update| progress.push(update)).unwrap();
         let range = inspect_range(&path, 0.02, 0.05).unwrap();
         std::fs::remove_file(path).unwrap();
         assert_eq!(report.codec, "PCM");
@@ -984,177 +873,9 @@ mod tests {
         assert!(
             progress
                 .iter()
-                .any(|update| update.stage == "Running blind models")
+                .any(|update| update.stage == "Inferring signal chain")
         );
         assert!((range.duration - 0.03).abs() < 0.001);
         assert!((range.centroid - 440.0).abs() < 35.0);
-    }
-
-    #[test]
-    #[ignore = "requires MUSPECTOR_DEVICE_FIXTURE and the local AFx identity model"]
-    fn inspector_device_fixture_matches_labels() {
-        let root = PathBuf::from(
-            std::env::var("MUSPECTOR_DEVICE_FIXTURE")
-                .expect("set MUSPECTOR_DEVICE_FIXTURE to the labelled WAV directory"),
-        );
-        let mut paths = std::fs::read_dir(root)
-            .unwrap()
-            .map(|entry| entry.unwrap().path())
-            .filter(|path| path.extension().is_some_and(|value| value == "wav"))
-            .collect::<Vec<_>>();
-        paths.sort();
-        assert!(!paths.is_empty());
-        let mut true_positive = [0_usize; 3];
-        let mut false_positive = [0_usize; 3];
-        let mut false_negative = [0_usize; 3];
-        let mut exact = 0_usize;
-        let mut identity_rat = [0_usize; 2];
-        let mut identity_non_catalog = [0_usize; 2];
-        for path in paths {
-            let report = inspect(&path).unwrap();
-            let name = path
-                .file_stem()
-                .and_then(|value| value.to_str())
-                .unwrap()
-                .to_ascii_lowercase();
-            let expected = [
-                name.contains("drive")
-                    || name.contains("fuzz")
-                    || name.contains("rat")
-                    || name.contains("muff"),
-                name.contains("delay") || name.contains("echo"),
-                name.contains("ambience")
-                    || name.contains("dream")
-                    || name.contains("reverb")
-                    || name.contains("room")
-                    || name.contains("hall")
-                    || name.contains("plate"),
-            ];
-            let actual = [Kind::Drive, Kind::Delay, Kind::Reverb].map(|kind| {
-                report
-                    .chain
-                    .effects
-                    .iter()
-                    .find(|effect| effect.kind == kind)
-                    .is_some_and(|effect| effect.active)
-            });
-            let scores = [Kind::Drive, Kind::Delay, Kind::Reverb].map(|kind| {
-                report
-                    .chain
-                    .effects
-                    .iter()
-                    .find(|effect| effect.kind == kind)
-                    .map_or(0.0, |effect| effect.score)
-            });
-            let drive_model = report
-                .chain
-                .effects
-                .iter()
-                .find(|effect| effect.kind == Kind::Drive)
-                .and_then(|effect| effect.model.as_deref());
-            let drive_evidence = report
-                .chain
-                .effects
-                .iter()
-                .find(|effect| effect.kind == Kind::Drive)
-                .map(|effect| effect.evidence.as_str());
-            println!(
-                "{} expected {expected:?} actual {actual:?} scores {scores:?} model {drive_model:?} evidence {drive_evidence:?}",
-                path.display()
-            );
-            if name.contains("rat") {
-                identity_rat[1] += 1;
-                identity_rat[0] += usize::from(drive_model == Some("RAT"));
-            } else if name.contains("drive") || name.contains("fuzz") {
-                identity_non_catalog[1] += 1;
-                identity_non_catalog[0] += usize::from(drive_model.is_some());
-            }
-            exact += usize::from(actual == expected);
-            for index in 0..3 {
-                true_positive[index] += usize::from(expected[index] && actual[index]);
-                false_positive[index] += usize::from(!expected[index] && actual[index]);
-                false_negative[index] += usize::from(expected[index] && !actual[index]);
-            }
-            if name == "clean" {
-                assert_eq!(actual, [false; 3], "{}", path.display());
-            }
-        }
-        assert!(identity_rat[0] * 2 >= identity_rat[1]);
-        assert!(identity_non_catalog[0] * 5 <= identity_non_catalog[1]);
-        for index in 0..3 {
-            let recall =
-                true_positive[index] as f64 / (true_positive[index] + false_negative[index]) as f64;
-            let precision =
-                true_positive[index] as f64 / (true_positive[index] + false_positive[index]) as f64;
-            assert!(recall >= 0.80, "class {index} recall {recall}");
-            assert!(precision >= 0.50, "class {index} precision {precision}");
-        }
-        assert!(exact >= 9, "external exact matches {exact}/15");
-    }
-
-    #[test]
-    #[ignore = "requires MUSPECTOR_DEVICE_FIXTURE with clean.wav"]
-    fn inspector_clean_import_builds_portable_profile() {
-        let root = PathBuf::from(
-            std::env::var("MUSPECTOR_DEVICE_FIXTURE")
-                .expect("set MUSPECTOR_DEVICE_FIXTURE to the labelled WAV directory"),
-        );
-        let clean = root.join("clean.wav");
-        let training = training_from_clean(&clean).unwrap();
-        assert!(!training.calibrated());
-        let restored = blind::Training::import(&training.export()).unwrap();
-        assert_eq!(restored.name(), "clean");
-        assert!(!restored.calibrated());
-        let report = inspect_with_training(&clean, restored.clone()).unwrap();
-        let clean_actual = [Kind::Drive, Kind::Delay, Kind::Reverb].map(|kind| {
-            report
-                .chain
-                .effects
-                .iter()
-                .find(|effect| effect.kind == kind)
-                .unwrap()
-                .active
-        });
-        assert_eq!(clean_actual, [false; 3]);
-
-        let mut paths = std::fs::read_dir(root)
-            .unwrap()
-            .map(|entry| entry.unwrap().path())
-            .filter(|path| path.extension().is_some_and(|value| value == "wav"))
-            .collect::<Vec<_>>();
-        paths.sort();
-        let mut exact = 0;
-        for path in &paths {
-            let report = inspect_with_training(path, restored.clone()).unwrap();
-            let name = path
-                .file_stem()
-                .and_then(|value| value.to_str())
-                .unwrap()
-                .to_ascii_lowercase();
-            let expected = [
-                name.contains("drive")
-                    || name.contains("fuzz")
-                    || name.contains("rat")
-                    || name.contains("muff"),
-                name.contains("delay") || name.contains("echo"),
-                name.contains("ambience")
-                    || name.contains("dream")
-                    || name.contains("reverb")
-                    || name.contains("room")
-                    || name.contains("hall")
-                    || name.contains("plate"),
-            ];
-            let actual = [Kind::Drive, Kind::Delay, Kind::Reverb].map(|kind| {
-                report
-                    .chain
-                    .effects
-                    .iter()
-                    .find(|effect| effect.kind == kind)
-                    .is_some_and(|effect| effect.active)
-            });
-            exact += usize::from(actual == expected);
-            println!("{} expected {expected:?} actual {actual:?}", path.display());
-        }
-        println!("clean-only exact {exact}/{}", paths.len());
     }
 }
