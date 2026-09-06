@@ -92,6 +92,30 @@ signal analysis and heuristic chain proposals only. Model package licenses are
 independent from Muspector's Apache-2.0 source license and must permit the
 intended use before loading.
 
+### Live remix interaction
+
+The existing effect cards are the live control surface; remixing must not open
+a second editor. Dragging changes the displayed forward signal order, while the
+runtime remains responsible for applying inverse stages in the order required
+by the complete graph. Individual inverse models remain order-agnostic.
+
+After a model adapter is connected, every accepted reorder, bypass, and knob
+change sends the latest complete chain to `ModelRuntime::update_chain`. The
+decode worker applies it at a block boundary with parameter smoothing, without
+closing the output stream or performing model work in the audio callback.
+Unsupported stages must stay visibly unavailable or pass through; the UI must
+never imply that raw playback is a rendered result.
+
+Analysis and offline-render progress belongs directly on the waveform. A scan
+advances from left to right across the affected range, using measured job
+progress rather than a decorative timer. The selected range keeps its normal
+highlight; during a scan only the unscanned portion is dimmed, and the cursor
+reveals the highlighted waveform as it advances. The scan cursor is a single
+solid line without glow;
+its percentage follows directly above the cursor rather than occupying a fixed
+corner badge. Selected-range Rescan implements this interaction; the same visual
+contract applies to future full-file rendering.
+
 ## Layout
 
 - `app`: GPUI state, interaction, and rendering

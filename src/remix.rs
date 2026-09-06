@@ -91,6 +91,10 @@ impl StreamSpec {
 /// `configure` and `update_chain` run away from the audio callback. Once
 /// configured, `process_block` must not allocate, lock, perform I/O, or change
 /// the interleaved audio geometry; it writes into the caller-owned output.
+/// The UI supplies the complete active chain in forward signal order after an
+/// accepted drag, bypass, or control edit. An inverse runtime chooses its own
+/// graph execution order; individual effect models must not depend on their UI
+/// position.
 pub trait ModelRuntime: Send {
     fn infer_segment(&mut self, audio: AudioView<'_>) -> Result<Option<ChainEstimate>>;
 

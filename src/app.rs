@@ -33,6 +33,7 @@ const TAB: Duration = Duration::from_millis(170);
 const HOLD: Duration = Duration::from_millis(2800);
 const REST: Duration = Duration::from_millis(760);
 const PROGRESS_FRAME: Duration = Duration::from_millis(16);
+const SCAN_HOLD: Duration = Duration::from_millis(480);
 const OPEN: usize = 0;
 const DEVICE_CLOSED: f32 = 50.0;
 const DEVICE_OPENED: f32 = 336.0;
@@ -492,6 +493,16 @@ struct Pending {
     cancelled: Arc<AtomicBool>,
 }
 
+#[derive(Clone)]
+struct Scan {
+    path: PathBuf,
+    range: (f32, f32),
+    progress: f32,
+    displayed_progress: f32,
+    stage: &'static str,
+    job: u64,
+}
+
 #[derive(Clone, Copy)]
 struct SelectionMenu {
     position: Point<Pixels>,
@@ -763,6 +774,7 @@ pub struct Muspector {
     pending: Vec<Pending>,
     active: Option<usize>,
     pending_active: Option<u64>,
+    scan: Option<Scan>,
     dirty: bool,
     audio_dirty: bool,
     tab_dragging: Option<usize>,
@@ -836,6 +848,7 @@ impl Muspector {
             pending: Vec::new(),
             active: None,
             pending_active: None,
+            scan: None,
             dirty: false,
             audio_dirty: false,
             tab_dragging: None,
@@ -1790,6 +1803,7 @@ impl Muspector {
         }
         self.audio = None;
         self.pending.clear();
+        self.scan = None;
         self.tabs.clear();
         self.source = None;
         self.revision = None;
@@ -2460,15 +2474,83 @@ impl Muspector {
         self.document_cancelled = Some(cancelled.clone());
         self.job = self.job.wrapping_add(1);
         let job = self.job;
+        self.scan = Some(Scan {
+            path: path.clone(),
+            range: selection,
+            progress: 0.0,
+            displayed_progress: 0.0,
+            stage: "Queued",
+            job,
+        });
+        cx.notify();
 
+        let (progress_tx, progress_rx) = std::sync::mpsc::channel();
         let task = cx.background_spawn(async move {
             let Some(_permit) = AnalysisPermit::acquire(&cancelled) else {
                 anyhow::bail!("analysis cancelled");
             };
-            analysis::inspect_range_cancellable(&source, from, to, || {
-                cancelled.load(Ordering::Relaxed)
-            })
+            analysis::inspect_range_cancellable(
+                &source,
+                from,
+                to,
+                |progress| {
+                    let _ = progress_tx.send(progress);
+                },
+                || cancelled.load(Ordering::Relaxed),
+            )
         });
+        cx.spawn(async move |view, cx| {
+            loop {
+                cx.background_executor().timer(PROGRESS_FRAME).await;
+                let mut latest = None;
+                let mut disconnected = false;
+                loop {
+                    match progress_rx.try_recv() {
+                        Ok(progress) => latest = Some(progress),
+                        Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                            disconnected = true;
+                            break;
+                        }
+                    }
+                }
+                let scanning = view
+                    .update(cx, |this, cx| {
+                        let scan = this.scan.as_mut().filter(|scan| scan.job == job)?;
+                        let mut changed = false;
+                        if let Some(progress) = latest {
+                            scan.progress = scan.progress.max(progress.value.clamp(0.0, 1.0));
+                            scan.stage = progress.stage;
+                            changed = true;
+                        }
+                        let displayed = advance_progress(scan.displayed_progress, scan.progress);
+                        if displayed != scan.displayed_progress {
+                            scan.displayed_progress = displayed;
+                            changed = true;
+                        }
+                        if changed {
+                            cx.notify();
+                        }
+                        Some(scan.progress >= 1.0 && scan.displayed_progress >= 1.0)
+                    })
+                    .ok()
+                    .flatten();
+                let Some(finished) = scanning else {
+                    break;
+                };
+                if disconnected && finished {
+                    cx.background_executor().timer(SCAN_HOLD).await;
+                    let _ = view.update(cx, |this, cx| {
+                        if this.scan.as_ref().is_some_and(|scan| scan.job == job) {
+                            this.scan = None;
+                            cx.notify();
+                        }
+                    });
+                    break;
+                }
+            }
+        })
+        .detach();
         cx.spawn(async move |view, cx| {
             let result = task.await;
             let _ = view.update(cx, |this, cx| {
@@ -2476,10 +2558,19 @@ impl Muspector {
                     return;
                 }
                 this.document_cancelled = None;
+                if let Some(scan) = this.scan.as_mut().filter(|scan| scan.job == job) {
+                    if result.is_ok() {
+                        scan.progress = 1.0;
+                        scan.stage = "Finalizing";
+                    } else {
+                        this.scan = None;
+                    }
+                }
                 let Some(index) = this.tabs.iter().position(|tab| tab.path == previous.path) else {
                     return;
                 };
                 if this.tabs[index].generation != previous.generation {
+                    this.scan = None;
                     this.warn(
                         "Rescan result discarded because the document changed".to_owned(),
                         cx,
@@ -4567,6 +4658,19 @@ impl Muspector {
         let cursor = self.cursor;
         let playhead = self.playhead;
         let selection = self.selection;
+        let scan = self
+            .scan
+            .as_ref()
+            .filter(|scan| scan.path == report.path)
+            .map(|scan| (scan.range, scan.displayed_progress));
+        let scan_paint = scan;
+        let scan_cursor = scan.and_then(|((start, end), progress)| {
+            let (start, end) = ordered(start, end);
+            let scanned = start + (end - start) * progress.clamp(0.0, 1.0);
+            (view..=view + visible)
+                .contains(&scanned)
+                .then_some((((scanned - view) / visible).clamp(0.03, 0.97), progress))
+        });
         let bounds: Rc<RefCell<Option<Bounds<Pixels>>>> = Rc::new(RefCell::new(None));
         let capture = bounds.clone();
         let locate = bounds.clone();
@@ -4648,14 +4752,6 @@ impl Muspector {
                                 let mut color = theme::ACCENT_SOFT;
                                 color.a = 0.72;
                                 window.paint_path(path, color);
-                            }
-                            for x in [x1, x2] {
-                                let mut edge = PathBuilder::stroke(px(1.5));
-                                edge.move_to(point(x, top));
-                                edge.line_to(point(x, bottom));
-                                if let Ok(path) = edge.build() {
-                                    window.paint_path(path, theme::ACCENT);
-                                }
                             }
                         }
 
@@ -4772,6 +4868,65 @@ impl Muspector {
                             }
                         }
 
+                        if let Some(((start, end), progress)) = scan_paint {
+                            let (start, end) = ordered(start, end);
+                            let scanned = start + (end - start) * progress.clamp(0.0, 1.0);
+                            let x2 = left + width * ((scanned - view) / visible).clamp(0.0, 1.0);
+                            let x3 = left + width * ((end - view) / visible).clamp(0.0, 1.0);
+                            if x3 > x2 {
+                                let mut veil = PathBuilder::fill();
+                                veil.add_polygon(
+                                    &[
+                                        point(x2, top),
+                                        point(x3, top),
+                                        point(x3, bottom),
+                                        point(x2, bottom),
+                                    ],
+                                    true,
+                                );
+                                if let Ok(path) = veil.build() {
+                                    let mut color = theme::TRACK;
+                                    color.a = 0.82;
+                                    window.paint_path(path, color);
+                                }
+                            }
+                            if (view..=view + visible).contains(&scanned) {
+                                let cursor_top = top + px(12.0);
+                                let mut edge = PathBuilder::stroke(px(2.0));
+                                edge.move_to(point(x2, cursor_top));
+                                edge.line_to(point(x2, bottom));
+                                if let Ok(path) = edge.build() {
+                                    window.paint_path(path, theme::ACCENT_HOVER);
+                                }
+                                let mut head = PathBuilder::fill();
+                                head.add_polygon(
+                                    &[
+                                        point(x2 - px(5.0), cursor_top),
+                                        point(x2 + px(5.0), cursor_top),
+                                        point(x2, cursor_top + px(8.0)),
+                                    ],
+                                    true,
+                                );
+                                if let Ok(path) = head.build() {
+                                    window.paint_path(path, theme::ACCENT_HOVER);
+                                }
+                            }
+                        }
+
+                        if let Some((start, end)) = selection {
+                            let (start, end) = ordered(start, end);
+                            let x1 = left + width * ((start - view) / visible).clamp(0.0, 1.0);
+                            let x2 = left + width * ((end - view) / visible).clamp(0.0, 1.0);
+                            for x in [x1, x2] {
+                                let mut edge = PathBuilder::stroke(px(1.5));
+                                edge.move_to(point(x, top));
+                                edge.line_to(point(x, bottom));
+                                if let Ok(path) = edge.build() {
+                                    window.paint_path(path, theme::ACCENT);
+                                }
+                            }
+                        }
+
                         if let Some(position) = cursor {
                             let x = left + width * ((position - view) / visible).clamp(0.0, 1.0);
                             let mut marker = PathBuilder::stroke(px(1.0));
@@ -4809,6 +4964,26 @@ impl Muspector {
                 )
                 .size_full(),
             )
+            .children(scan_cursor.map(|(position, progress)| {
+                div()
+                    .absolute()
+                    .left(relative(position))
+                    .ml(px(-18.0))
+                    .top_1()
+                    .w(px(36.0))
+                    .h(px(17.0))
+                    .rounded(theme::RADIUS)
+                    .bg(theme::PANEL)
+                    .border_1()
+                    .border_color(theme::LINE)
+                    .text_size(px(9.0))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(theme::ACCENT)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(format!("{:.0}%", progress * 100.0))
+            }))
             .child(
                 div()
                     .absolute()

@@ -108,12 +108,13 @@ pub fn inspect_range_cancellable(
     path: &Path,
     start: f64,
     end: f64,
+    progress: impl FnMut(Progress),
     cancelled: impl FnMut() -> bool,
 ) -> Result<Report> {
     if !start.is_finite() || !end.is_finite() || start < 0.0 || end <= start {
         bail!("Invalid analysis range");
     }
-    inspect_span(path, Some((start, end)), |_| {}, cancelled)
+    inspect_span(path, Some((start, end)), progress, cancelled)
 }
 
 fn inspect_span(
@@ -869,7 +870,15 @@ mod tests {
         assert!(inspect_cancellable(&path, |_| {}, || true).is_err());
         let mut progress = Vec::new();
         let report = inspect_cancellable(&path, |update| progress.push(update), || false).unwrap();
-        let range = inspect_range_cancellable(&path, 0.02, 0.05, || false).unwrap();
+        let mut range_progress = Vec::new();
+        let range = inspect_range_cancellable(
+            &path,
+            0.02,
+            0.05,
+            |update| range_progress.push(update),
+            || false,
+        )
+        .unwrap();
         std::fs::remove_file(path).unwrap();
         assert_eq!(report.codec, "PCM");
         assert_eq!(report.rate, rate);
@@ -891,6 +900,12 @@ mod tests {
                 .iter()
                 .any(|update| update.stage == "Inferring signal chain")
         );
+        assert!(
+            range_progress
+                .windows(2)
+                .all(|updates| updates[0].value <= updates[1].value)
+        );
+        assert_eq!(range_progress.last().map(|update| update.value), Some(1.0));
         assert!((range.duration - 0.03).abs() < 0.001);
         assert!((range.centroid - 440.0).abs() < 35.0);
     }
