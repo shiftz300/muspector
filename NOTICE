@@ -4,6 +4,12 @@ Muspector source code is licensed under the Apache License 2.0. Interface icons
 from Lucide are ISC licensed; attribution and the license text are in
 assets/icons/LUCIDE.md. Rust dependencies retain their upstream licenses.
 
-Muspector does not bundle model weights, model datasets, or training artifacts.
-Model packages supplied through a future muspector-models adapter remain
-separate works under their own licenses and usage restrictions.
+Muspector bundles ONNX conversions of the GFX Classifier model weights by
+Marco Comunità and contributors. GFX Classifier is BSD-3-Clause licensed; its
+copyright notice, license, provenance, and upstream links are retained in
+models/gfx. The conversion changes the model container, not the learned
+weights.
+
+No GFX training dataset or source recording is bundled. Other model packages
+supplied through a future muspector-models adapter remain separate works under
+their own licenses and usage restrictions.

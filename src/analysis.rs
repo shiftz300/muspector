@@ -1,4 +1,7 @@
-use crate::chain::{self, Chain, Fingerprint};
+use crate::{
+    chain::{self, Chain, Fingerprint},
+    gfx,
+};
 use anyhow::{Context, Result, bail};
 use ebur128::{EbuR128, Mode};
 use realfft::{RealFftPlanner, RealToComplex};
@@ -167,6 +170,7 @@ fn inspect_span(
     let mut signal = Signal::new(rate);
     let mut timeline = Timeline::new(rate);
     let mut space = Space::new(rate);
+    let mut gfx = gfx::Scan::new(rate);
     let mut sample_buffer = None;
     let mut frames = 0_u64;
     let mut count = 0_u64;
@@ -264,6 +268,7 @@ fn inspect_span(
             timeline.push(mono, momentary);
             space.push(mono);
             signal.push(mono)?;
+            gfx.push(mono);
         }
         if packet_end >= to {
             break 'packets;
@@ -297,13 +302,23 @@ fn inspect_span(
         value: 0.84,
         stage: "Inferring signal chain",
     });
-    let chain = chain::infer(fingerprint(
+    let mut chain = chain::infer(fingerprint(
         &profile,
         db(peak),
         db(peak) - db(rms),
         &spectrum,
         space,
     ));
+    progress(Progress {
+        value: 0.88,
+        stage: "Running GFX model",
+    });
+    if let Some(candidate) = gfx.finish().context("GFX blind inference failed")? {
+        chain.apply_drive_model(candidate.effect());
+    }
+    if cancelled() {
+        bail!("analysis cancelled");
+    }
     progress(Progress {
         value: 1.0,
         stage: "Finalizing",
@@ -889,6 +904,14 @@ mod tests {
         assert!(report.spectrum.iter().all(|value| value.is_finite()));
         assert!(!report.profile.points.is_empty());
         assert!(report.profile.points.len() <= LIMIT);
+        let drive = report
+            .chain
+            .effects
+            .iter()
+            .find(|effect| effect.kind == crate::chain::Kind::Drive)
+            .expect("Drive family slot");
+        assert!(drive.subtype.is_some());
+        assert!(drive.model.is_some());
         assert!(
             progress
                 .windows(2)
@@ -899,6 +922,11 @@ mod tests {
             progress
                 .iter()
                 .any(|update| update.stage == "Inferring signal chain")
+        );
+        assert!(
+            progress
+                .iter()
+                .any(|update| update.stage == "Running GFX model")
         );
         assert!(
             range_progress

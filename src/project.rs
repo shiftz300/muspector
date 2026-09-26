@@ -27,6 +27,7 @@ struct Document {
 struct Effect {
     position: usize,
     kind: String,
+    subtype: Option<String>,
     model: Option<String>,
     enabled: bool,
     confidence: f64,
@@ -71,6 +72,7 @@ pub fn save(
             .map(|(position, effect)| Effect {
                 position: position + 1,
                 kind: effect.kind.name().to_owned(),
+                subtype: effect.subtype.map(|subtype| subtype.name().to_owned()),
                 model: effect.model.clone(),
                 enabled: effect.active,
                 confidence: effect.score,

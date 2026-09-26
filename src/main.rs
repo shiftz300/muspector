@@ -6,9 +6,11 @@ mod assets;
 mod audio;
 mod chain;
 mod clip;
+mod gfx;
 mod icon;
 mod project;
 pub mod remix;
+mod render;
 mod theme;
 
 use app::Muspector;

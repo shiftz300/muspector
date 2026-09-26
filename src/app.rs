@@ -481,6 +481,13 @@ struct Tab {
     generation: u64,
     motion: usize,
     shift: f32,
+    preview: Option<Rendered>,
+}
+
+#[derive(Clone)]
+struct Rendered {
+    path: PathBuf,
+    _owner: crate::clip::TemporaryAudio,
 }
 
 #[derive(Clone)]
@@ -783,6 +790,10 @@ pub struct Muspector {
     closing: Vec<Closing>,
     job: u64,
     document_cancelled: Option<Arc<AtomicBool>>,
+    render_cancelled: Option<Arc<AtomicBool>>,
+    render_job: u64,
+    render_debounce: u64,
+    render_scan: Option<Scan>,
     inspect_job: u64,
     hovers: [Hover; 1],
     glows: [usize; 1],
@@ -857,6 +868,10 @@ impl Muspector {
             closing: Vec::new(),
             job: 0,
             document_cancelled: None,
+            render_cancelled: None,
+            render_job: 0,
+            render_debounce: 0,
+            render_scan: None,
             inspect_job: 0,
             hovers: [Hover::Idle; 1],
             glows: [0; 1],
@@ -1238,12 +1253,22 @@ impl Muspector {
         ];
     }
 
+    fn playback_source(&self) -> Option<PathBuf> {
+        self.active
+            .and_then(|index| self.tabs.get(index))
+            .and_then(|tab| tab.preview.as_ref())
+            .map(|preview| preview.path.clone())
+            .or_else(|| self.source.clone())
+    }
+
     fn seek(&mut self, position: f32, cx: &mut Context<Self>) {
         let position = position.clamp(0.0, 1.0);
         self.playhead = Some(position);
-        let Some((path, duration)) = (match (&self.state, &self.source) {
-            (State::Ready(report), Some(source)) => Some((source.clone(), report.duration)),
-            _ => None,
+        let Some((path, duration)) = (match &self.state {
+            State::Ready(report) => self
+                .playback_source()
+                .map(|source| (source, report.duration)),
+            State::Empty | State::Loading(_) => None,
         }) else {
             return;
         };
@@ -1263,9 +1288,11 @@ impl Muspector {
     }
 
     fn toggle_play(&mut self, cx: &mut Context<Self>) {
-        let Some((path, duration)) = (match (&self.state, &self.source) {
-            (State::Ready(report), Some(source)) => Some((source.clone(), report.duration)),
-            _ => None,
+        let Some((path, duration)) = (match &self.state {
+            State::Ready(report) => self
+                .playback_source()
+                .map(|source| (source, report.duration)),
+            State::Empty | State::Loading(_) => None,
         }) else {
             return;
         };
@@ -1375,6 +1402,202 @@ impl Muspector {
         }
     }
 
+    fn schedule_render(&mut self, debounce: bool, cx: &mut Context<Self>) {
+        if !matches!(self.state, State::Ready(_)) || self.active.is_none() {
+            return;
+        }
+        if let Some(cancelled) = self.render_cancelled.take() {
+            cancelled.store(true, Ordering::Relaxed);
+        }
+        self.render_job = self.render_job.wrapping_add(1).max(1);
+        self.render_debounce = self.render_debounce.wrapping_add(1).max(1);
+        self.render_scan = None;
+        let request = self.render_job;
+        let debounce_request = self.render_debounce;
+        if !debounce {
+            self.start_render(request, cx);
+            return;
+        }
+        cx.spawn(async move |view, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(140))
+                .await;
+            let _ = view.update(cx, |this, cx| {
+                if this.render_job == request && this.render_debounce == debounce_request {
+                    this.start_render(request, cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn start_render(&mut self, job: u64, cx: &mut Context<Self>) {
+        if self.render_job != job {
+            return;
+        }
+        let Some(index) = self.active else {
+            return;
+        };
+        self.sync_active();
+        let Some(tab) = self.tabs.get(index) else {
+            return;
+        };
+        let document = tab.path.clone();
+        let source = tab.source.clone();
+        let chain = tab.report.chain.clone();
+        let duration = tab.report.duration;
+        let generation = tab.generation;
+        let cancelled = Arc::new(AtomicBool::new(false));
+        self.render_cancelled = Some(cancelled.clone());
+        self.render_scan = Some(Scan {
+            path: document.clone(),
+            range: (0.0, 1.0),
+            progress: 0.0,
+            displayed_progress: 0.0,
+            stage: "Rendering",
+            job,
+        });
+        cx.notify();
+
+        let (progress_tx, progress_rx) = std::sync::mpsc::channel();
+        let render_cancelled = cancelled.clone();
+        let task = cx.background_spawn(async move {
+            crate::clip::render(
+                &source,
+                &chain,
+                duration,
+                |progress| {
+                    let _ = progress_tx.send(progress);
+                },
+                || render_cancelled.load(Ordering::Relaxed),
+            )
+        });
+        cx.spawn(async move |view, cx| {
+            loop {
+                cx.background_executor().timer(PROGRESS_FRAME).await;
+                let mut latest = None;
+                let mut disconnected = false;
+                loop {
+                    match progress_rx.try_recv() {
+                        Ok(progress) => latest = Some(progress),
+                        Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                            disconnected = true;
+                            break;
+                        }
+                    }
+                }
+                let rendering = view
+                    .update(cx, |this, cx| {
+                        let scan = this.render_scan.as_mut().filter(|scan| scan.job == job)?;
+                        let mut changed = false;
+                        if let Some(progress) = latest {
+                            scan.progress = scan.progress.max(progress.clamp(0.0, 1.0));
+                            changed = true;
+                        }
+                        let displayed = advance_progress(scan.displayed_progress, scan.progress);
+                        if displayed != scan.displayed_progress {
+                            scan.displayed_progress = displayed;
+                            changed = true;
+                        }
+                        if changed {
+                            cx.notify();
+                        }
+                        Some(scan.progress >= 1.0 && scan.displayed_progress >= 1.0)
+                    })
+                    .ok()
+                    .flatten();
+                let Some(finished) = rendering else {
+                    break;
+                };
+                if disconnected && finished {
+                    cx.background_executor().timer(SCAN_HOLD).await;
+                    let _ = view.update(cx, |this, cx| {
+                        if this
+                            .render_scan
+                            .as_ref()
+                            .is_some_and(|scan| scan.job == job)
+                        {
+                            this.render_scan = None;
+                            cx.notify();
+                        }
+                    });
+                    break;
+                }
+            }
+        })
+        .detach();
+        cx.spawn(async move |view, cx| {
+            let result = task.await;
+            let _ = view.update(cx, |this, cx| {
+                if this.render_job != job {
+                    return;
+                }
+                this.render_cancelled = None;
+                if let Some(scan) = this.render_scan.as_mut().filter(|scan| scan.job == job) {
+                    if result.is_ok() {
+                        scan.progress = 1.0;
+                        scan.stage = "Finalizing";
+                    } else {
+                        this.render_scan = None;
+                    }
+                }
+                let Some(index) = this.tabs.iter().position(|tab| tab.path == document) else {
+                    return;
+                };
+                if this.tabs[index].generation != generation {
+                    this.render_scan = None;
+                    return;
+                }
+                match result {
+                    Ok(rendered) => {
+                        let path = rendered.path.clone();
+                        let active = this.active == Some(index);
+                        let was_playing =
+                            active && this.audio.as_ref().is_some_and(|audio| !audio.paused());
+                        let position = if active {
+                            this.audio
+                                .as_ref()
+                                .map(|audio| {
+                                    (audio.position().as_secs_f64() / duration.max(f64::EPSILON))
+                                        .clamp(0.0, 1.0) as f32
+                                })
+                                .or(this.playhead)
+                        } else {
+                            None
+                        };
+                        this.tabs[index].preview = Some(Rendered {
+                            path,
+                            _owner: rendered.owner,
+                        });
+                        if active {
+                            if let Some(position) = position {
+                                this.playhead = Some(position);
+                            }
+                            this.playback = this.playback.wrapping_add(1);
+                            if let Some(audio) = &mut this.audio {
+                                audio.clear();
+                            }
+                            if was_playing {
+                                this.toggle_play(cx);
+                            } else {
+                                cx.notify();
+                            }
+                        } else {
+                            cx.notify();
+                        }
+                    }
+                    Err(error) => {
+                        if !cancelled.load(Ordering::Relaxed) {
+                            this.error(format!("Could not render preview: {error:#}"), cx);
+                        }
+                    }
+                }
+            });
+        })
+        .detach();
+    }
+
     fn watch(&mut self, cx: &mut Context<Self>) {
         self.playback = self.playback.wrapping_add(1);
         let playback = self.playback;
@@ -1392,7 +1615,7 @@ impl Muspector {
                             return false;
                         };
                         let duration = report.duration;
-                        let Some(path) = this.source.clone() else {
+                        let Some(path) = this.playback_source() else {
                             return false;
                         };
                         let Some(audio) = &this.audio else {
@@ -1457,6 +1680,7 @@ impl Muspector {
         }
         self.sync_active();
         let tab = self.tabs[index].clone();
+        let needs_render = tab.preview.is_none();
         self.active = Some(index);
         self.pending_active = None;
         self.state = State::Ready(tab.report);
@@ -1469,6 +1693,9 @@ impl Muspector {
         self.reset_editor();
         self.expanded = tab.expanded;
         cx.notify();
+        if needs_render {
+            self.schedule_render(false, cx);
+        }
     }
 
     fn activate_pending(&mut self, id: u64, cx: &mut Context<Self>) {
@@ -1616,8 +1843,10 @@ impl Muspector {
             tab.expanded = self.expanded;
             tab.history = self.history.clone();
             tab.generation = tab.generation.wrapping_add(1).max(1);
+            tab.preview = None;
         }
         cx.notify();
+        self.schedule_render(false, cx);
     }
 
     fn undo(&mut self, cx: &mut Context<Self>) {
@@ -1801,9 +2030,13 @@ impl Muspector {
         if let Some(cancelled) = self.document_cancelled.take() {
             cancelled.store(true, Ordering::Relaxed);
         }
+        if let Some(cancelled) = self.render_cancelled.take() {
+            cancelled.store(true, Ordering::Relaxed);
+        }
         self.audio = None;
         self.pending.clear();
         self.scan = None;
+        self.render_scan = None;
         self.tabs.clear();
         self.source = None;
         self.revision = None;
@@ -2242,6 +2475,7 @@ impl Muspector {
                             generation: 0,
                             motion: 0,
                             shift: 0.0,
+                            preview: None,
                         });
                         if foreground {
                             this.pending_active = None;
@@ -2290,6 +2524,7 @@ impl Muspector {
         };
         self.mark_dirty();
         self.record(action, false);
+        self.schedule_render(false, cx);
 
         let slot: usize = effect;
         self.cards[slot] = self.cards[slot].wrapping_add(1);
@@ -2324,6 +2559,7 @@ impl Muspector {
         if let Some(action) = action {
             self.mark_dirty();
             self.record(action, true);
+            self.schedule_render(true, cx);
             cx.notify();
         }
     }
@@ -2362,6 +2598,7 @@ impl Muspector {
             self.mark_dirty();
             let effect_name = model.as_deref().unwrap_or_else(|| kind.name());
             self.record(format!("Reset {effect_name} {name}"), false);
+            self.schedule_render(false, cx);
             cx.notify();
         }
     }
@@ -2380,6 +2617,7 @@ impl Muspector {
                 tab.expanded = self.expanded;
             }
             self.record("Reset chain", false);
+            self.schedule_render(false, cx);
             cx.notify();
         }
     }
@@ -2586,6 +2824,7 @@ impl Muspector {
 
                         this.tabs[index].report.chain = chain.clone();
                         this.tabs[index].baseline = baseline.clone();
+                        this.tabs[index].preview = None;
                         let audio_dirty = previous.audio_dirty;
                         this.tabs[index].dirty = audio_dirty;
                         this.tabs[index].audio_dirty = audio_dirty;
@@ -2603,6 +2842,7 @@ impl Muspector {
                             this.expanded = expanded;
                             this.selection = Some(selection);
                             this.record("Rescan selection", false);
+                            this.schedule_render(false, cx);
                         } else {
                             let snapshot = Snapshot {
                                 chain,
@@ -2794,6 +3034,7 @@ impl Muspector {
                             _working_audio: Some(edited.owner),
                         });
                         this.tabs[index].source = source.clone();
+                        this.tabs[index].preview = None;
                         this.tabs[index].report = report.clone();
                         this.tabs[index].baseline = baseline.clone();
                         this.tabs[index].dirty = true;
@@ -2816,6 +3057,7 @@ impl Muspector {
                                 },
                                 false,
                             );
+                            this.schedule_render(false, cx);
                         } else {
                             let snapshot = Snapshot {
                                 chain: this.tabs[index].report.chain.clone(),
@@ -2973,6 +3215,7 @@ impl Muspector {
     fn finish_drag(&mut self, cx: &mut Context<Self>) {
         if self.dragging.take().is_some() {
             self.history.merge = None;
+            self.schedule_render(false, cx);
             cx.notify();
         }
     }
@@ -3099,6 +3342,7 @@ impl Muspector {
                     if let Some(action) = action {
                         self.mark_dirty();
                         self.record(action, false);
+                        self.schedule_render(false, cx);
                     }
                     cx.notify();
                 } else {
@@ -4662,6 +4906,11 @@ impl Muspector {
             .scan
             .as_ref()
             .filter(|scan| scan.path == report.path)
+            .or_else(|| {
+                self.render_scan
+                    .as_ref()
+                    .filter(|scan| scan.path == report.path)
+            })
             .map(|scan| (scan.range, scan.displayed_progress));
         let scan_paint = scan;
         let scan_cursor = scan.and_then(|((start, end), progress)| {
@@ -5462,8 +5711,18 @@ impl Muspector {
                             .text_xs()
                             .text_color(theme::MUTED)
                             .child(format!(
-                                "· {:.0}% heuristic candidate",
-                                report.chain.score * 100.0
+                                "· {:.0}% {} candidate",
+                                report.chain.score * 100.0,
+                                if report
+                                    .chain
+                                    .effects
+                                    .iter()
+                                    .any(|effect| effect.subtype.is_some())
+                                {
+                                    "GFX + heuristic"
+                                } else {
+                                    "heuristic"
+                                }
                             )),
                     )
                     .child(
@@ -5559,7 +5818,7 @@ impl Muspector {
             index,
             name: effect.name().to_owned(),
             named: effect.model.is_some(),
-            kind: effect.kind.name(),
+            kind: effect.display_kind(),
             score: effect.score,
             evidence: effect.evidence.clone(),
             params: effect.params.clone(),
@@ -5771,7 +6030,7 @@ impl Muspector {
                             .text_size(px(10.0))
                             .font_weight(gpui::FontWeight::SEMIBOLD)
                             .text_color(theme::INK)
-                            .child(effect.kind.name()),
+                            .child(effect.display_kind()),
                     )
                     .child(
                         div()

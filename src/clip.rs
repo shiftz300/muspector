@@ -16,6 +16,8 @@ use symphonia::core::{
 };
 use tempfile::{Builder, TempPath};
 
+use crate::{chain::Chain, render::Graybox};
+
 #[derive(Clone)]
 pub struct TemporaryAudio {
     _path: Arc<TempPath>,
@@ -39,6 +41,45 @@ impl Clip {
 pub struct Edit {
     pub path: PathBuf,
     pub(crate) owner: TemporaryAudio,
+}
+
+pub fn render(
+    source_path: &Path,
+    chain: &Chain,
+    duration: f64,
+    mut progress: impl FnMut(f32),
+    cancelled: impl Fn() -> bool,
+) -> Result<Edit> {
+    let mut source = Source::open(source_path)?;
+    let expected = (duration.max(0.0) * f64::from(source.rate)).round() as u64;
+    let (target, owner, file) = temporary()?;
+    let mut writer = Wav::new(file, source.rate, source.channels)?;
+    let mut renderer = Graybox::new(chain, source.rate, source.channels);
+    let mut rendered = 0_u64;
+    while let Some(mut samples) = source.next()? {
+        if cancelled() {
+            bail!("preview render cancelled");
+        }
+        renderer.process(&mut samples);
+        rendered = rendered.saturating_add((samples.len() / source.channels) as u64);
+        writer.write(&samples)?;
+        progress(if expected == 0 {
+            0.0
+        } else {
+            (rendered as f64 / expected as f64).clamp(0.0, 0.995) as f32
+        });
+    }
+    if cancelled() {
+        bail!("preview render cancelled");
+    }
+    if writer.finish()? == 0 {
+        bail!("audio source contains no decodable frames");
+    }
+    progress(1.0);
+    Ok(Edit {
+        path: target,
+        owner,
+    })
 }
 
 struct Source {
@@ -415,5 +456,23 @@ mod tests {
         assert!(path.exists());
         drop(retained);
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn preview_render_reports_real_progress_and_preserves_frames() {
+        let (source, _source_owner, file) = temporary().expect("create source");
+        let mut writer = Wav::new(file, 1_000, 1).expect("create source");
+        writer.write(&vec![0.25; 2_000]).expect("write source");
+        writer.finish().expect("finish source");
+        let chain = Chain {
+            effects: Vec::new(),
+            score: 0.0,
+        };
+        let mut values = Vec::new();
+        let rendered = render(&source, &chain, 2.0, |value| values.push(value), || false)
+            .expect("render preview");
+        assert_eq!(frames(&rendered.path), 2_000);
+        assert_eq!(values.last().copied(), Some(1.0));
+        assert!(values.windows(2).all(|pair| pair[0] <= pair[1]));
     }
 }

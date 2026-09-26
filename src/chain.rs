@@ -8,6 +8,23 @@ pub enum Kind {
     Reverb,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Subtype {
+    Overdrive,
+    Distortion,
+    Fuzz,
+}
+
+impl Subtype {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Overdrive => "Overdrive",
+            Self::Distortion => "Distortion",
+            Self::Fuzz => "Fuzz",
+        }
+    }
+}
+
 impl Kind {
     pub fn name(self) -> &'static str {
         match self {
@@ -85,6 +102,7 @@ impl Param {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Effect {
     pub kind: Kind,
+    pub subtype: Option<Subtype>,
     pub model: Option<String>,
     pub active: bool,
     pub score: f64,
@@ -96,12 +114,38 @@ impl Effect {
     pub fn name(&self) -> &str {
         self.model.as_deref().unwrap_or_else(|| self.kind.name())
     }
+
+    pub fn display_kind(&self) -> &'static str {
+        self.subtype.map_or_else(|| self.kind.name(), Subtype::name)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Chain {
     pub effects: Vec<Effect>,
     pub score: f64,
+}
+
+impl Chain {
+    pub fn apply_drive_model(&mut self, effect: Effect) {
+        if let Some(slot) = self
+            .effects
+            .iter_mut()
+            .find(|candidate| candidate.kind == Kind::Drive)
+        {
+            *slot = effect;
+            let active = self
+                .effects
+                .iter()
+                .filter(|candidate| candidate.active)
+                .collect::<Vec<_>>();
+            self.score = if active.is_empty() {
+                0.0
+            } else {
+                active.iter().map(|candidate| candidate.score).sum::<f64>() / active.len() as f64
+            };
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -133,6 +177,7 @@ pub fn infer(f: Fingerprint) -> Chain {
     let effects = vec![
         Effect {
             kind: Kind::Gate,
+            subtype: None,
             model: None,
             active: gate >= 0.55,
             score: gate,
@@ -152,6 +197,7 @@ pub fn infer(f: Fingerprint) -> Chain {
         },
         Effect {
             kind: Kind::Comp,
+            subtype: None,
             model: None,
             active: comp >= 0.48,
             score: comp,
@@ -171,6 +217,7 @@ pub fn infer(f: Fingerprint) -> Chain {
         },
         Effect {
             kind: Kind::Drive,
+            subtype: None,
             model: None,
             active: drive >= 0.55,
             score: drive,
@@ -193,6 +240,7 @@ pub fn infer(f: Fingerprint) -> Chain {
         },
         Effect {
             kind: Kind::Eq,
+            subtype: None,
             model: None,
             active: true,
             score: 0.58,
@@ -208,6 +256,7 @@ pub fn infer(f: Fingerprint) -> Chain {
         },
         Effect {
             kind: Kind::Delay,
+            subtype: None,
             model: None,
             active: delay >= 0.52,
             score: delay,
@@ -220,6 +269,7 @@ pub fn infer(f: Fingerprint) -> Chain {
         },
         Effect {
             kind: Kind::Reverb,
+            subtype: None,
             model: None,
             active: reverb >= 0.45,
             score: reverb,

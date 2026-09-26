@@ -18,6 +18,7 @@ ebur128 = "0.1.10"
 gpui = { git = "https://github.com/zed-industries/zed", rev = "ac2f097559ecbaab6f55ca5a519f53b80ac54afb", default-features = false, features = ["font-kit"] }
 gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "ac2f097559ecbaab6f55ca5a519f53b80ac54afb", default-features = false, features = ["font-kit", "runtime_shaders", "wayland", "x11"] }
 realfft = "3.5"
+rubato = "4.0.0"
 rodio = { version = "0.22.2", default-features = false, features = [
     "playback",
     "symphonia-aac",
@@ -45,6 +46,7 @@ symphonia = { version = "0.5.5", default-features = false, features = [
 ] }
 sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }
 tempfile = "3.27"
+tract-onnx = "=0.23.5"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 cpal = { version = "0.17.3", optional = true, features = ["asio"] }
